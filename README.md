@@ -42,9 +42,11 @@ Incluye automatización de respaldos, facilitando la gestión de información si
    ```bash
    git clone https://github.com/MaryAlva09/Respaldo-Mensual.git
    Ejecuta la aplicación
-2. Selecciona el rango de fechas
-3. Configura (opcional) la automatización del respaldo
-4. El sistema generará automáticamente el respaldo organizado
+2. Ejecuta el instalador
+3. Pon la contraseña
+4. Ve a la ventana de configuracion, selecciona opciones y pc a la que se mandaran los archivos
+5. Guardar la configuracion
+6. El sistema generará automáticamente el respaldo organizado
 
 🎯 Objetivo del proyecto
 
@@ -53,7 +55,7 @@ Automatizar y simplificar el proceso de respaldo de archivos mediante una herram
 📸 Capturas
 
 🔒 Posibles mejoras
-Integración con servicios en la nube (Google Drive)
+-Integración con servicios en la nube (Google Drive)
 
 ⭐ Notas
 
