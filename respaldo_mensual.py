@@ -791,6 +791,7 @@ def run_backup(cfg: dict, status_cb=None, count_cb=None) -> dict:
     # ── Finalizar ──────────────────────────────────────────────────────
     total_archivos = len(cp.get("archivos_ok", []))
     cfg["last_backup"]   = str(date.today())
+    cfg["last_backup_month"]  = month_label   # mes que se respaldo (ej. "2026-03")
     cfg["retry_pending"] = False
     save_config(cfg)
     msg("Respaldo completado exitosamente.")
@@ -826,14 +827,24 @@ def check_and_run_headless():
     cfg   = load_config()
     today = date.today()
 
-    # Verificar checkpoint del mes
+  # Calcular mes a respaldar
     start_d, _ = month_range()
     month_label = start_d.strftime("%Y-%m")
+
+    # Verificar si este mes ya fue respaldado exitosamente (guardado en config)
+    if cfg.get("last_backup_month") == month_label:
+        log.info(f"El mes {month_label} ya fue respaldado exitosamente. Nada que hacer.")
+        return
+
+    # Verificar checkpoint del mes
     cp = _load_checkpoint(month_label)
 
-    # Ya completo este mes
+    # Checkpoint dice que ya completo
     if cp.get("fase") == "completo" or cp.get("red_ok"):
-        log.info(f"Respaldo de {month_label} ya completado.")
+        log.info(f"Respaldo de {month_label} ya completado (checkpoint).")
+        # Actualizar config para no volver a revisar
+        cfg["last_backup_month"] = month_label
+        save_config(cfg)
         return
 
     # Fallido definitivo
