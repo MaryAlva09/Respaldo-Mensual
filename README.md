@@ -30,7 +30,7 @@ Incluye automatización de respaldos, facilitando la gestión de información si
 
 ## 🛠️ Tecnologías utilizadas
 
-- Lenguaje: (C# / Python) ← AJUSTA
+- Lenguaje: (Python) ← AJUSTA
 - Sistema operativo: Windows
 - Control de versiones: Git
 
