@@ -189,65 +189,155 @@ def parse_email_date(msg) -> date | None:
             pass
         return None
 
-def _limpiar_nombre(texto: str, max_len: int = 50) -> str:
-    """Convierte texto a nombre de archivo valido."""
-    import unicodedata
-    # Normalizar acentos
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    # Quitar caracteres invalidos en nombres de archivo Windows
-    texto = "".join(c for c in texto if c.isalnum() or c in " -_.,()").strip()
-    return texto[:max_len].strip(" .")
+def _safe_header(value: str, max_len: int = 50) -> str:
+    """Limpia un header de correo para nombre de archivo. Rapido."""
+    if not value:
+        return ""
+    try:
+        parts = email.header.decode_header(value)
+        decoded = []
+        for part, enc in parts:
+            if isinstance(part, bytes):
+                decoded.append(part.decode(enc or "utf-8", errors="replace"))
+            else:
+                decoded.append(str(part))
+        value = " ".join(decoded)
+    except Exception:
+        pass
+    bad = set('/\\:*?"<>|')
+    value = "".join(c if c not in bad and ord(c) >= 32 else "_" for c in value)
+    return value[:max_len].strip(" .")
+
 
 def export_emails_to_eml(mbox_path: Path, dest_folder: Path,
                           start_date: date, end_date: date,
                           progress_cb=None) -> int:
     """
-    Lee un archivo mbox y exporta cada mensaje del rango como .eml individual.
-    Nombre del archivo: YYYY-MM-DD - Remitente - Asunto.eml
-    Devuelve el numero de correos exportados.
+    Exporta correos del rango como .eml individuales.
+    - Lee el mbox una sola vez en memoria
+    - Filtra por fecha leyendo solo headers (no carga cuerpo ni adjuntos)
+    - Escribe en paralelo con ThreadPoolExecutor para maxima velocidad
     """
+    import re as _re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     dest_folder.mkdir(parents=True, exist_ok=True)
-    exported = 0
+
+    # Leer mbox completo de una vez
     try:
-        mb = mailbox.mbox(str(mbox_path), create=False)
-        nombres_usados = set()
-        for i, msg in enumerate(mb):
-            msg_date = parse_email_date(msg)
-            if msg_date is None or not (start_date <= msg_date <= end_date):
-                continue
-
-            # Extraer remitente (solo el nombre o direccion, sin angulos)
-            from_raw = msg.get("From", "desconocido")
-            if "<" in from_raw:
-                remitente = from_raw.split("<")[0].strip().strip('"')
-            else:
-                remitente = from_raw.split("@")[0].strip()
-            remitente = _limpiar_nombre(remitente, 30) or "desconocido"
-
-            # Asunto limpio
-            asunto = msg.get("Subject", "sin asunto")
-            asunto = _limpiar_nombre(asunto, 60) or "sin asunto"
-
-            # Nombre final: 2026-02-18 - Remitente - Asunto.eml
-            base = f"{msg_date.isoformat()} - {remitente} - {asunto}"
-            fname = base + ".eml"
-
-            # Evitar duplicados
-            if fname in nombres_usados:
-                fname = f"{base} ({i}).eml"
-            nombres_usados.add(fname)
-
-            eml_path = dest_folder / fname
-            with open(eml_path, "wb") as f:
-                f.write(msg.as_bytes(policy=email.policy.compat32))
-            exported += 1
-            if progress_cb and exported % 10 == 0:
-                progress_cb(f"  {exported} correos exportados de {mbox_path.name}...")
-        mb.close()
+        with open(mbox_path, "rb") as f:
+            raw = f.read()
     except Exception as e:
         if progress_cb:
-            progress_cb(f"  Advertencia leyendo {mbox_path.name}: {e}")
+            progress_cb(f"  Error abriendo {mbox_path.name}: {e}")
+        return 0
+
+    # Dividir en bloques por separador mbox
+    posiciones = [m.start() for m in _re.finditer(rb"^From ", raw, _re.MULTILINE)]
+    posiciones.append(len(raw))
+    total = len(posiciones) - 1
+
+    if progress_cb:
+        progress_cb(f"  {mbox_path.name}: {total} mensajes en disco, filtrando...")
+
+    # ── Fase 1: Filtrar por fecha (solo headers, sin cuerpo) ──────────────
+    pendientes = []   # lista de (bloque_bytes, idx)
+    for idx in range(total):
+        bloque = raw[posiciones[idx]:posiciones[idx + 1]]
+        sep = bloque.find(b"\n\n")
+        if sep == -1:
+            sep = bloque.find(b"\r\n\r\n")
+        headers_raw = bloque[:sep] if sep != -1 else bloque[:3000]
+
+        try:
+            h = headers_raw.decode("utf-8", errors="replace")
+        except Exception:
+            h = headers_raw.decode("latin-1", errors="replace")
+
+        msg_date = None
+        for line in h.splitlines():
+            if line.lower().startswith("date:"):
+                ds = line[5:].strip().split("(")[0].strip()
+                try:
+                    msg_date = email.utils.parsedate_to_datetime(ds).date()
+                except Exception:
+                    try:
+                        tup = email.utils.parsedate(ds)
+                        if tup:
+                            msg_date = date(tup[0], tup[1], tup[2])
+                    except Exception:
+                        pass
+                break
+
+        if msg_date is None or not (start_date <= msg_date <= end_date):
+            continue
+
+        # Extraer From y Subject para nombre de archivo
+        remitente = "desconocido"
+        asunto    = "sin_asunto"
+        for line in h.splitlines():
+            ll = line.lower()
+            if ll.startswith("from:") and remitente == "desconocido":
+                fr = line[5:].strip()
+                raw_rem = fr.split("<")[0].strip().strip('"') if "<" in fr else fr.split("@")[0].strip()
+                remitente = _safe_header(raw_rem, 30) or "desconocido"
+            elif ll.startswith("subject:") and asunto == "sin_asunto":
+                asunto = _safe_header(line[8:].strip(), 60) or "sin_asunto"
+
+        pendientes.append((bloque, idx, msg_date, remitente, asunto))
+
+    if progress_cb:
+        progress_cb(f"  {mbox_path.name}: {len(pendientes)} correos del mes, escribiendo...")
+
+    if not pendientes:
+        return 0
+
+    # ── Fase 2: Generar nombres unicos ────────────────────────────────────
+    nombres_usados = set()
+    tareas = []
+    for bloque, idx, msg_date, remitente, asunto in pendientes:
+        base  = f"{msg_date.isoformat()} - {remitente} - {asunto}"
+        fname = base + ".eml"
+        if fname in nombres_usados:
+            fname = f"{base} ({idx}).eml"
+        nombres_usados.add(fname)
+        tareas.append((dest_folder / fname, bloque))
+
+    # ── Fase 3: Escritura en paralelo ─────────────────────────────────────
+    exported  = 0
+    errores   = 0
+    lock      = threading.Lock()
+
+    # Usar max 8 hilos — mas no mejora en disco local de Windows
+    workers = min(8, len(tareas))
+
+    def escribir(args):
+        path, data = args
+        path.write_bytes(data)
+        return True
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futuros = {ex.submit(escribir, t): t for t in tareas}
+        done = 0
+        for fut in as_completed(futuros):
+            done += 1
+            try:
+                fut.result()
+                with lock:
+                    exported += 1
+            except Exception as e:
+                with lock:
+                    errores += 1
+            if progress_cb and done % 50 == 0:
+                progress_cb(f"  {done}/{len(tareas)} correos escritos de {mbox_path.name}...")
+
+    if progress_cb:
+        msg = f"  {mbox_path.name}: {exported} correos exportados"
+        if errores:
+            msg += f" ({errores} errores)"
+        progress_cb(msg)
+
     return exported
 
 def backup_thunderbird(tmp_root: Path, start_date: date, end_date: date,
