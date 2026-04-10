@@ -154,12 +154,48 @@ def count_emails_in_mbox(mbox_path: Path, start_date: date, end_date: date) -> i
     """Cuenta cuantos correos hay en el rango sin exportarlos."""
     count = 0
     try:
-        mb = mailbox.mbox(str(mbox_path), create=False)
-        for msg in mb:
-            d = parse_email_date(msg)
-            if d and start_date <= d <= end_date:
-                count += 1
-        mb.close()
+        with open(mbox_path, "rb") as f:
+            lines = f.readlines()
+
+        # Encontrar mensajes
+        message_starts = []
+        for i, line in enumerate(lines):
+            if line.startswith(b"From "):
+                message_starts.append(i)
+        message_starts.append(len(lines))
+
+        for idx in range(len(message_starts) - 1):
+            start_line = message_starts[idx]
+            end_line = message_starts[idx + 1]
+
+            # Leer solo headers
+            header_lines = []
+            for line_num in range(start_line, min(start_line + 30, end_line)):
+                line = lines[line_num]
+                header_lines.append(line)
+                if line.strip() == b"":  # Fin de headers
+                    break
+
+            header_text = b"".join(header_lines).decode("utf-8", errors="replace")
+
+            # Buscar fecha
+            for line in header_text.splitlines():
+                if line.lower().startswith("date:"):
+                    ds = line[5:].strip().split("(")[0].strip()
+                    try:
+                        msg_date = email.utils.parsedate_to_datetime(ds).date()
+                        if start_date <= msg_date <= end_date:
+                            count += 1
+                    except Exception:
+                        try:
+                            tup = email.utils.parsedate(ds)
+                            if tup:
+                                msg_date = date(tup[0], tup[1], tup[2])
+                                if start_date <= msg_date <= end_date:
+                                    count += 1
+                        except Exception:
+                            pass
+                    break
     except Exception:
         pass
     return count
