@@ -14,8 +14,14 @@ from tkinter import ttk, messagebox, filedialog
 # ───────────────────────────────────────────────
 
 # Carpetas de Thunderbird que nos interesan
-TB_TARGET_FOLDERS = {"INBOX", "Sent", "Sent Messages", "Enviados", "Bandeja de entrada",
-                     "Drafts", "Borradores"}
+TB_TARGET_FOLDERS = {"INBOX", "Sent", "Sent Messages", "Enviados", "Bandeja de entrada"}
+
+# Carpetas que nunca se respaldan (papelera, spam, borradores, etc.)
+EXCLUDED_FOLDERS = {
+    "trash", "trash_1", "junk", "spam", "basura", "papelera",
+    "borradores", "drafts", "templates", "deleted",
+    "deleted messages", "deleted items", "enviados eliminados",
+}
 
 def get_user_home() -> Path:
     """
@@ -108,7 +114,7 @@ def find_mbox_files(profile: Path):
 
     for account_name, account_dir in accounts:
         # Determinar si es cuenta local o IMAP
-        is_local = "local" in account_name.lower() or account_dir.parent.name == "Mail"
+        is_local = account_dir.parent.name.lower() == "mail"
 
         # Nombre legible de la cuenta
         cuenta = account_name.replace("imap.gmail.com", "Gmail")
@@ -127,8 +133,7 @@ def find_mbox_files(profile: Path):
             if str(mbox_file) in seen:
                 continue
             # Ignorar archivos de sistema de Thunderbird
-            if mbox_file.name in ("Trash", "Junk", "Templates", "Drafts",
-                                   "Borradores", "Spam", "Basura"):
+            if mbox_file.name.lower() in EXCLUDED_FOLDERS:
                 continue
 
             name_upper = mbox_file.name.upper()
@@ -447,12 +452,6 @@ def backup_thunderbird(tmp_root: Path, start_date: date, end_date: date,
     return result
 
 # ───────────────────────────────────────────────
-def _user_file(name: str) -> Path:
-    """Archivo en la carpeta del usuario local (no del admin)."""
-    userprofile = os.environ.get("USERPROFILE", "")
-    base = Path(userprofile) if userprofile and Path(userprofile).exists() else Path.home()
-    return base / name
-
 CONFIG_FILE = _user_file(".respaldo_mensual.json")
 LOG_FILE    = _user_file("respaldo_mensual.log")
 
@@ -681,6 +680,11 @@ def _escribir_estado_red(cfg: dict, pc_label: str, mes: str, status: str,
 
 MAX_REINTENTOS_HABILES = 9  # dias habiles maximos (semana y media: lun-sab)
 
+# ── Modo pruebas ──────────────────────────────────────────────────────────────
+# Cambia a False cuando el sistema este listo para produccion.
+# En True: desactiva el bloqueo por dias habiles y el marcado como "fallido definitivo".
+MODO_PRUEBAS = True
+
 def _checkpoint_path(month_label: str) -> Path:
     return _user_file(f".respaldo_checkpoint_{month_label}.json")
 
@@ -728,11 +732,14 @@ def _puede_reintentar(cp: dict) -> tuple:
     """
     Devuelve (puede, motivo).
     No puede si: ya esta completo, marcado fallido, o supero MAX dias habiles.
+    En MODO_PRUEBAS se omite el bloqueo por dias habiles y fallido definitivo.
     """
-    if cp.get("fallido"):
-        return False, "Marcado como fallido definitivo"
     if cp.get("red_ok") or cp.get("fase") == "completo":
         return False, "Ya completado"
+    if MODO_PRUEBAS:
+        return True, "OK (modo pruebas)"
+    if cp.get("fallido"):
+        return False, "Marcado como fallido definitivo"
     # Contar dias habiles usados desde el primer intento
     if cp.get("ultimo_intento"):
         try:
@@ -744,7 +751,7 @@ def _puede_reintentar(cp: dict) -> tuple:
             pass
     return True, "OK"
 
-def run_backup(cfg: dict, status_cb=None, count_cb=None) -> dict:
+def run_backup(cfg: dict, status_cb=None, count_cb=None, force: bool = False) -> dict:
     def msg(text, level="info"):
         getattr(log, level)(text)
         if status_cb:
@@ -761,14 +768,17 @@ def run_backup(cfg: dict, status_cb=None, count_cb=None) -> dict:
     # ── Cargar checkpoint del mes ──────────────────────────────────────
     cp = _load_checkpoint(month_label)
 
-    # Verificar si puede reintentar
-    puede, motivo = _puede_reintentar(cp)
-    if not puede:
-        msg(f"Respaldo cancelado: {motivo}")
-        if cp.get("fallido"):
-            _escribir_estado_red(cfg, pc_label, month_label, "error",
-                                 0, [], str(net_dest), motivo)
-        return {"status": "cancelado", "motivo": motivo}
+    # Verificar si puede reintentar (se omite si force=True)
+    if not force:
+        puede, motivo = _puede_reintentar(cp)
+        if not puede:
+            msg(f"Respaldo cancelado: {motivo}")
+            if cp.get("fallido"):
+                _escribir_estado_red(cfg, pc_label, month_label, "error",
+                                     0, [], str(net_dest), motivo)
+            return {"status": "cancelado", "motivo": motivo}
+    else:
+        msg("Respaldo forzado: se ignoran restricciones de dias habiles y checkpoint.")
 
     # Actualizar contadores del checkpoint
     cp["intentos"]       += 1
@@ -779,7 +789,7 @@ def run_backup(cfg: dict, status_cb=None, count_cb=None) -> dict:
             date.today()
         )
         cp["dias_habiles_usados"] = dias
-        if dias >= MAX_REINTENTOS_HABILES:
+        if dias >= MAX_REINTENTOS_HABILES and not MODO_PRUEBAS:
             cp["fallido"] = True
             _save_checkpoint(cp)
             msg(f"Respaldo fallido: supero {MAX_REINTENTOS_HABILES} dias habiles de reintento.")
@@ -1234,6 +1244,13 @@ class RespaldoApp(tk.Tk):
                                  font=("Courier New", 12, "bold"), padx=28, pady=12,
                                  command=self._start_backup)
         self.btn_run.pack(pady=14)
+
+        self.btn_force = tk.Button(p, text="⚙ Forzar respaldo (ignorar restricciones)",
+                                   bg=self.PANEL, fg=self.FG2, activebackground=self.ACCENT,
+                                   relief="flat", cursor="hand2",
+                                   font=("Courier New", 9), padx=12, pady=6,
+                                   command=self._start_backup_forzado)
+        self.btn_force.pack(pady=(0, 4))
 
         self.progress = ttk.Progressbar(p, style="Accent.Horizontal.TProgressbar",
                                         mode="determinate", length=700)
@@ -1727,6 +1744,42 @@ class RespaldoApp(tk.Tk):
         self.live_log.configure(state="disabled"); self.progress["value"] = 0
         self.cfg["backup_thunderbird"] = self._tb_var.get()
         threading.Thread(target=self._run_backup_thread, daemon=True).start()
+
+    def _start_backup_forzado(self):
+        if not self.cfg.get("share_root"):
+            messagebox.showwarning("Sin configurar",
+                "Ve a Configuracion e ingresa la ruta de red.")
+            return
+        if not messagebox.askyesno("Forzar respaldo",
+                "Esto ejecutara el respaldo ignorando la ventana de dias habiles\n"
+                "y el estado del checkpoint actual.\n\n"
+                "¿Continuar?"):
+            return
+        self.btn_run.configure(state="disabled", text="Procesando...")
+        self.btn_force.configure(state="disabled")
+        self.live_log.configure(state="normal"); self.live_log.delete("1.0", "end")
+        self.live_log.configure(state="disabled"); self.progress["value"] = 0
+        self.cfg["backup_thunderbird"] = self._tb_var.get()
+        threading.Thread(target=self._run_backup_thread_forzado, daemon=True).start()
+
+    def _run_backup_thread_forzado(self):
+        def cb(m): self.after(0, lambda msg=m: self._log(msg))
+        def prog(i, t):
+            self.after(0, lambda v=i, mx=t: (
+                self.progress.configure(maximum=mx, value=v),
+                self.lbl_prog.configure(text=str(v) + " / " + str(mx) + " archivos")))
+        try:
+            r = run_backup(self.cfg, status_cb=cb, count_cb=prog, force=True)
+            msg = "Listo.  " + str(r["files"]) + " archivos  ->  " + r["net_dest"]
+            self.after(0, lambda: self._log(msg, self.GREEN))
+        except Exception as e:
+            err = str(e)
+            self.after(0, lambda: self._log("Error: " + err, self.RED))
+        finally:
+            self.after(0, lambda: (
+                self.btn_run.configure(state="normal", text="EJECUTAR RESPALDO AHORA"),
+                self.btn_force.configure(state="normal")))
+            self.after(600, self._refresh_log_tab)
 
     def _run_backup_thread(self):
         def cb(m): self.after(0, lambda msg=m: self._log(msg))
