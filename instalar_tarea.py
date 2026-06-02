@@ -128,6 +128,7 @@ def make_xml_permanent(python_path, script_path, username):
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <ExecutionTimeLimit>PT8H</ExecutionTimeLimit>
     <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <StartWhenAvailable>true</StartWhenAvailable>
@@ -236,3 +237,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
