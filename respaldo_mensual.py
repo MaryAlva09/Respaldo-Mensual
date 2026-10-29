@@ -1,1785 +1,1424 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-respaldo_mensual.py - Sistema de respaldo mensual por red local Windows.
-"""
+Respaldo Mensual v4
+  python respaldo_mensual.py                     -> interfaz gráfica
+  python respaldo_mensual.py --catchup            -> tarea programada (ejecución normal, cada hora)
+  python respaldo_mensual.py --auto               -> respalda el mes anterior sin condiciones
+  python respaldo_mensual.py --instalar [opciones] -> instala sin abrir ventanas (ver instalar())
 
-import os, sys, socket, shutil, threading, logging, json
-import email, email.policy, email.utils, mailbox, calendar
-from datetime import datetime, date, timedelta
+Detección de usuario: el programa ignora el usuario administrador ("Propietario" y similares) y
+respalda solo el perfil de usuario normal que encuentra en C:\\Users. Al correr como SYSTEM (tarea
+programada), esto funciona sin importar qué usuario tenga la sesión iniciada.
+
+FASE 1 (recopilar): copia lo del mes a una carpeta local oculta (no necesita red).
+FASE 2 (enviar):    la envía a PC100 (reintenta; retoma archivos y correos a medias).
+"""
+import os, sys, json, glob, re, time, shutil, socket, hashlib, queue, threading, subprocess
+import email.utils
+from email.parser import BytesParser
+from datetime import datetime, date
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 
-# ───────────────────────────────────────────────
-#  Modulo Thunderbird
-# ───────────────────────────────────────────────
+APP_DIR_NAME = "SyncAgent"              # nombre neutro: no debe llamar la atención en C:\ProgramData
+TASK_NAME = "SyncAgentTask"
+_PROGRAMDATA = os.environ.get("ProgramData")
+if _PROGRAMDATA and os.name == "nt":
+    CFG_DIR = Path(_PROGRAMDATA) / APP_DIR_NAME          # mismo lugar sin importar qué cuenta ejecute el programa
+else:
+    CFG_DIR = Path.home() / f".{APP_DIR_NAME.lower()}"   # equipo de pruebas (no Windows)
+CFG_FILE = CFG_DIR / "config.json"
+LOG_FILE = CFG_DIR / "log.txt"
+LOCK_FILE = CFG_DIR / "running.lock"
+PROG_DIR = CFG_DIR / "progress"
+WINDOW_DAYS = 9
+CK_SECONDS = 15
 
-# Carpetas de Thunderbird que nos interesan
-TB_TARGET_FOLDERS = {"INBOX", "Sent", "Sent Messages", "Enviados", "Bandeja de entrada",
-                     "Drafts", "Borradores"}
+USER_SUBDIRS = ["Downloads", "Documents", "Pictures", "Videos", "Desktop"]
+SKIP_USER_NAMES = {"public", "default", "default user", "all users"}
+DEFAULTS = {
+    "machine_name": socket.gethostname().upper(),
+    "destination": r"\\192.168.1.100\Respaldos",     # usar IP fija de PC100 como principal
+    "destination_alt": r"\\PC100\Respaldos",          # nombre como respaldo del destino
+    "local_root": str(Path(os.environ.get("SystemDrive", "C:") + "\\") / "ProgramData" / APP_DIR_NAME / "data"),
+    "delete_local_after_send": False,
+    "sources": [],                                    # carpetas EXTRA (ej. scans compartidos), no las del usuario
+    "thunderbird": "",                                 # vacío = detectar automático del usuario objetivo
+    "target_user": "",                                 # vacío = autodetectar (excluye excluded_users)
+    "excluded_users": ["propietario", "administrador", "administrator", "admin", "wdagutilityaccount"],
+    "run_as_system": True,
+    "net_user": "",   # usuario de la carpeta compartida de PC100, ej. PC100\respaldo
+    "net_pass": "",   # contraseña (se guarda en config.json; para mayor seguridad usa cmdkey manualmente)
+    "last_done": "", "last_status": "", "last_attempt": "",
+}
+for _p in (r"C:\Scans", r"C:\Scan", r"C:\Escaneos", r"C:\Escaner"):
+    if Path(_p).is_dir():
+        DEFAULTS["sources"].append(_p)
 
-def get_user_home() -> Path:
-    """
-    Detecta la carpeta home del usuario LOCAL de la PC, no del admin/propietario.
-    ULAPC37 -> C:\\Users\\lapc37  (o como se llame la cuenta local)
-    """
-    ADMINS = {"administrator", "administrador", "propietario", "owner",
-              "public", "publico", "default", "all users", "default user"}
-    hostname = socket.gethostname().upper()
-    digits   = "".join(c for c in hostname if c.isdigit())
-    users_dir = Path("C:/Users")
-    candidates = []
+SKIP_MAIL = {
+    "trash", "junk", "spam", "drafts", "draft", "deleted", "deleted items", "deleted messages",
+    "bin", "papelera", "borradores", "correo no deseado", "elementos eliminados", "basura",
+    "unsent messages", "bulk mail", "outbox", "bandeja de salida",
+}
+SKIP_DIRS = {"appdata", "$recycle.bin", "node_modules", ".git", "__pycache__"}
+
+
+class Stopped(Exception):
+    pass
+
+
+# ------------------------------------------------------------------ config
+def load_cfg():
+    cfg = json.loads(json.dumps(DEFAULTS))  # copia profunda
     try:
-        for d in users_dir.iterdir():
-            if d.is_dir() and d.name.lower() not in ADMINS:
-                candidates.append(d)
+        cfg.update(json.loads(CFG_FILE.read_text(encoding="utf-8")))
     except Exception:
         pass
-    # Un solo candidato no-admin
-    if len(candidates) == 1:
-        return candidates[0]
-    # Buscar por digitos del hostname (ULAPC37 -> buscar "37" en nombre de usuario)
-    if candidates and digits:
-        for d in candidates:
-            if digits in d.name.lower():
-                return d
-        for d in candidates:
-            if hostname.lower() in d.name.lower() or d.name.lower() in hostname.lower():
-                return d
-    # Fallback: USERPROFILE si no es admin
-    userprofile = os.environ.get("USERPROFILE", "")
-    if userprofile and Path(userprofile).exists():
-        p = Path(userprofile)
-        if p.name.lower() not in ADMINS:
-            return p
-    if candidates:
-        return sorted(candidates, key=lambda d: d.stat().st_mtime, reverse=True)[0]
-    return Path.home()
+    return cfg
 
-def _user_file(name: str) -> Path:
-    """Archivo en la carpeta del usuario local."""
-    return get_user_home() / name
 
-def find_thunderbird_profile() -> Path | None:
-    """Localiza el perfil activo de Thunderbird del usuario local."""
-    home = get_user_home()
-    tb_root = home / "AppData" / "Roaming" / "Thunderbird" / "Profiles"
-    if not tb_root.exists():
-        return None
-    profiles = sorted(tb_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in profiles:
-        if p.is_dir():
-            return p
-    return None
+def save_cfg(cfg):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    CFG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def find_thunderbird_accounts(profile: Path) -> list:
+
+def hide_path(p: Path):
+    """Oculta una carpeta (atributos Oculto+Sistema). No se hace pasar por un archivo de Microsoft/Windows."""
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            subprocess.run(["attrib", "+h", "+s", str(p)], capture_output=True)
+    except Exception:
+        pass
+
+
+def lower_priority():
+    if os.name == "nt":
+        try:
+            import ctypes
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetPriorityClass(h, 0x00004000)   # BELOW_NORMAL_PRIORITY_CLASS
+        except Exception:
+            pass
+
+
+def prev_month(today=None):
+    t = today or date.today()
+    return (t.year - 1, 12) if t.month == 1 else (t.year, t.month - 1)
+
+
+def month_range(y, m):
+    return datetime(y, m, 1), datetime(y + (m == 12), 1 if m == 12 else m + 1, 1)
+
+
+def load_prog(tag):
+    try:
+        return json.loads((PROG_DIR / f"{tag}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {"files_done": False, "collect_done": False, "send_done": False,
+                "files": 0, "mails": 0, "errors": [], "mail": {}}
+
+
+def save_prog(tag, p):
+    PROG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PROG_DIR / f"{tag}.tmp"
+    tmp.write_text(json.dumps(p), encoding="utf-8")
+    os.replace(tmp, PROG_DIR / f"{tag}.json")
+
+
+def reset_month(cfg, tag):
+    """'Empezar de nuevo': borra lo recopilado localmente y los puntos de control de ese mes."""
+    shutil.rmtree(local_dir(cfg, tag), ignore_errors=True)
+    for p in PROG_DIR.glob(f"{tag}*"):
+        shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------ detección del usuario objetivo
+def get_user_profiles():
+    root = Path(os.environ.get("SystemDrive", "C:") + "\\") / "Users"
+    if not root.is_dir():
+        return []
+    out = []
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and d.name.lower() not in SKIP_USER_NAMES and not d.name.startswith("."):
+            out.append(d)
+    return out
+
+
+def pick_target_users(cfg, log=None):
+    profiles = get_user_profiles()
+    target = cfg.get("target_user", "").strip().lower()
+    if target:
+        cands = [d for d in profiles if target in d.name.lower()]
+        if not cands and log:
+            log(f"Usuario objetivo '{cfg['target_user']}' no encontrado. Perfiles en esta máquina: "
+                f"{[d.name for d in profiles]}")
+        return cands
+    excluded = [x.strip().lower() for x in cfg.get("excluded_users", []) if x.strip()]
+    cands = [d for d in profiles if not any(x and x in d.name.lower() for x in excluded)]
+    if log:
+        if not cands:
+            log(f"ERROR: no se detectó un usuario distinto al administrador. Perfiles vistos: "
+                f"{[d.name for d in profiles]}. Define 'Usuario objetivo' manualmente.")
+        elif len(cands) > 1:
+            log(f"Aviso: hay {len(cands)} usuarios candidatos {[d.name for d in cands]}; se respaldan todos. "
+                f"Define 'Usuario objetivo' si solo quieres uno.")
+    return cands
+
+
+def resolve_all_sources(cfg, log):
+    users = pick_target_users(cfg, log)
+    extra = [s for s in cfg.get("sources", []) if s.strip()]
+    found = []
+    for u in users:
+        for sub in USER_SUBDIRS:
+            p = u / sub
+            if p.is_dir():
+                found.append((f"{u.name}-{sub}", p))
+    return users, extra, found
+
+
+def find_thunderbird_profiles(user_home: Path):
     """
-    Devuelve lista de (nombre_legible, Path_carpeta) para cada cuenta.
-    Incluye cuentas IMAP (ImapMail/) y carpetas locales (Mail/).
+    Busca perfiles de Thunderbird bajo el perfil de un usuario.
+    Cubre los tres lugares donde puede estar según la versión y configuración:
+      1. AppData\\Roaming\\Thunderbird\\Profiles\\<perfil>   (instalación estándar)
+      2. AppData\\Local\\Thunderbird\\Profiles\\<perfil>     (algunas instalaciones empresariales)
+      3. Cualquier carpeta profiles.ini, para detectar rutas personalizadas
+    Devuelve lista de rutas de perfil válidas (tienen ImapMail, Mail, o prefs.js).
     """
-    accounts = []
+    candidates = []
 
-    # Cuentas IMAP (Gmail, etc.)
-    imap_root = profile / "ImapMail"
-    if imap_root.exists():
-        for account_dir in sorted(imap_root.iterdir()):
-            if account_dir.is_dir():
-                accounts.append((account_dir.name, account_dir))
+    # Rutas estándar donde Thunderbird guarda los perfiles
+    for base_rel in (
+        Path("AppData") / "Roaming" / "Thunderbird" / "Profiles",
+        Path("AppData") / "Local"   / "Thunderbird" / "Profiles",
+    ):
+        base = user_home / base_rel
+        if base.is_dir():
+            for p in base.iterdir():
+                if p.is_dir():
+                    candidates.append(p)
 
-    # Carpetas locales de Thunderbird (Mail/Local Folders/)
-    mail_root = profile / "Mail"
-    if mail_root.exists():
-        for account_dir in sorted(mail_root.iterdir()):
-            if account_dir.is_dir():
-                # Incluir aunque se llame "Local Folders" o cualquier nombre
-                accounts.append((account_dir.name, account_dir))
+    # Leer profiles.ini por si hay rutas personalizadas
+    for ini_rel in (
+        Path("AppData") / "Roaming" / "Thunderbird" / "profiles.ini",
+        Path("AppData") / "Local"   / "Thunderbird" / "profiles.ini",
+    ):
+        ini = user_home / ini_rel
+        if not ini.exists():
+            continue
+        try:
+            content = ini.read_text(encoding="utf-8", errors="replace")
+            for line in content.splitlines():
+                line = line.strip()
+                if not line.lower().startswith("path="):
+                    continue
+                rel_path = line[5:].strip().replace("/", os.sep)
+                # IsRelative=1 → relativa al directorio del .ini
+                candidate = ini.parent / rel_path
+                if candidate.is_dir():
+                    candidates.append(candidate)
+                # también intentar ruta absoluta tal cual
+                candidate2 = Path(rel_path)
+                if candidate2.is_dir():
+                    candidates.append(candidate2)
+        except Exception:
+            pass
 
-    return accounts
-
-def find_mbox_files(profile: Path):
-    """
-    Devuelve lista de (Path_mbox, etiqueta_legible) para todas las cuentas.
-    - Cuentas IMAP: solo INBOX y Enviados
-    - Carpetas locales: TODOS los archivos mbox (cualquier carpeta que el
-      usuario haya creado localmente en Thunderbird)
-    """
-    results = []
+    # Filtrar: un perfil válido tiene prefs.js, ImapMail o Mail
+    valid = []
     seen = set()
-    accounts = find_thunderbird_accounts(profile)
+    for p in candidates:
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        has_imap = (p / "ImapMail").is_dir()
+        has_mail = (p / "Mail").is_dir()
+        has_prefs = (p / "prefs.js").is_file()
+        if has_imap or has_mail or has_prefs:
+            valid.append(p)
 
-    for account_name, account_dir in accounts:
-        # Determinar si es cuenta local o IMAP
-        is_local = "local" in account_name.lower() or account_dir.parent.name == "Mail"
+    return valid
 
-        # Nombre legible de la cuenta
-        cuenta = account_name.replace("imap.gmail.com", "Gmail")
-        if cuenta.startswith("Gmail-"):
-            cuenta = "Gmail" + cuenta[6:]
-        if "local" in cuenta.lower() or cuenta.lower() == "local folders":
-            cuenta = "Carpetas locales"
 
-        for mbox_file in account_dir.rglob("*"):
-            if not mbox_file.is_file():
-                continue
-            if mbox_file.suffix != "":
-                continue
-            if mbox_file.name.endswith(".msf"):
-                continue
-            if str(mbox_file) in seen:
-                continue
-            # Ignorar archivos de sistema de Thunderbird
-            if mbox_file.name in ("Trash", "Junk", "Templates", "Drafts",
-                                   "Borradores", "Spam", "Basura"):
-                continue
+def resolve_thunderbird(cfg, users):
+    """
+    Devuelve lista de (etiqueta, ruta_de_perfil) para respaldar.
+    Si está configurado manualmente, lo usa directo.
+    Si no, busca en todos los usuarios objetivo y devuelve todos los perfiles encontrados.
+    """
+    manual = cfg.get("thunderbird", "").strip()
+    if manual:
+        p = Path(manual)
+        if p.is_dir():
+            return [("manual", manual)]
+        # El manual apunta a la carpeta Profiles; probar un nivel arriba
+        if p.parent.is_dir() and (p.parent / "prefs.js").is_file():
+            return [("manual", str(p.parent))]
+        return [("manual-no-encontrado", manual)]
 
-            name_upper = mbox_file.name.upper()
+    out = []
+    for u in users:
+        profs = find_thunderbird_profiles(u)
+        for prof in profs:
+            out.append((u.name, str(prof)))
 
-            if is_local:
-                # En carpetas locales: respaldar TODOS los mbox
-                # (el usuario puede tener carpetas propias con cualquier nombre)
-                etiqueta = f"{cuenta} - {mbox_file.name}"
-                results.append((mbox_file, etiqueta))
-                seen.add(str(mbox_file))
+    return out
+
+
+def thunderbird_summary(cfg, users):
+    """
+    Devuelve un texto descriptivo del estado de la detección de Thunderbird,
+    para mostrarlo en la interfaz.
+    """
+    manual = cfg.get("thunderbird", "").strip()
+    if manual:
+        exists = Path(manual).is_dir()
+        return ("manual", f"Perfil manual: {manual}" + ("" if exists else " ⚠ NO ENCONTRADO"))
+
+    results = resolve_thunderbird(cfg, users)
+    if not results:
+        # Explicar por qué no se encontró nada
+        msgs = []
+        for u in users:
+            tb_base = u / "AppData" / "Roaming" / "Thunderbird"
+            if not tb_base.exists():
+                msgs.append(f"{u.name}: Thunderbird no instalado (no existe {tb_base})")
+            elif not (tb_base / "Profiles").exists():
+                msgs.append(f"{u.name}: Thunderbird instalado pero sin carpeta Profiles")
             else:
-                # En cuentas IMAP: solo INBOX y Enviados
-                for target in TB_TARGET_FOLDERS:
-                    if name_upper == target.upper():
-                        etiqueta = f"{cuenta} - {mbox_file.name}"
-                        results.append((mbox_file, etiqueta))
-                        seen.add(str(mbox_file))
-                        break
+                profs_dir = tb_base / "Profiles"
+                subdirs = list(profs_dir.iterdir()) if profs_dir.is_dir() else []
+                if not subdirs:
+                    msgs.append(f"{u.name}: carpeta Profiles vacía")
+                else:
+                    msgs.append(f"{u.name}: perfiles encontrados ({[d.name for d in subdirs]}) "
+                                f"pero ninguno tiene prefs.js, ImapMail ni Mail")
+        if not msgs:
+            msgs = ["No se detectaron usuarios objetivo"]
+        return ("error", "Thunderbird no detectado → " + " | ".join(msgs))
+
+    labels = [f"{lbl}: {Path(path).name}" for lbl, path in results]
+    return ("ok", f"Thunderbird detectado ({len(results)} perfil/es): " + ", ".join(labels))
+
+
+# ------------------------------------------------------------------ candado con latido
+def acquire_lock():
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode()); os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - LOCK_FILE.stat().st_mtime > 180:
+                    LOCK_FILE.unlink(); continue
+            except OSError:
+                pass
+            return False
+    return False
+
+
+def start_heartbeat():
+    ev = threading.Event()
+
+    def loop():
+        while not ev.wait(20):
+            try:
+                os.utime(str(LOCK_FILE))
+            except Exception:
+                pass
+    threading.Thread(target=loop, daemon=True).start()
+    return ev
+
+
+# ------------------------------------------------------------------ red / estado
+def unc_host(path):
+    p = path.strip()
+    return p[2:].split("\\")[0] if p.startswith("\\\\") else None
+
+
+def destinations(cfg):
+    return [d.strip() for d in (cfg["destination"], cfg.get("destination_alt", "")) if d and d.strip()]
+
+
+def dest_reachable(dest):
+    host = unc_host(dest)
+    if host:
+        try:
+            socket.create_connection((host, 445), 4).close()
+        except Exception as e:
+            return False, f"Sin red hacia {host} (puerto 445): {e}"
+    try:
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        return True, ""
+    except Exception as e:
+        return False, f"No se puede escribir en {dest}: {e}"
+
+
+def test_destinations(cfg, log):
+    """Diagnóstico detallado para el botón 'Probar conexión'."""
+    results = []
+    for dest in destinations(cfg):
+        host = unc_host(dest)
+        if host:
+            try:
+                ip = socket.gethostbyname(host)
+                log(f"{dest}: el nombre '{host}' se resuelve a {ip}")
+            except Exception as e:
+                log(f"{dest}: [FALLA] no se pudo resolver el nombre '{host}' (red pública, DNS, o IP incorrecta): {e}")
+                results.append((dest, False)); continue
+            try:
+                socket.create_connection((host, 445), 4).close()
+                log(f"{dest}: puerto 445 (compartir archivos) abierto en {host}")
+            except Exception as e:
+                log(f"{dest}: [FALLA] sin conexión al puerto 445 de {host} (firewall de PC100 o perfil de red): {e}")
+                results.append((dest, False)); continue
+        try:
+            p = Path(dest); p.mkdir(parents=True, exist_ok=True)
+            t = p / "_prueba_conexion.tmp"; t.write_text("ok"); t.unlink()
+            log(f"{dest}: escritura correcta")
+            results.append((dest, True))
+        except Exception as e:
+            log(f"{dest}: [FALLA] no se pudo escribir (usuario/contraseña o permisos de la carpeta): {e}")
+            results.append((dest, False))
     return results
 
 
-def count_emails_in_mbox(mbox_path: Path, start_date: date, end_date: date) -> int:
-    """Cuenta cuantos correos hay en el rango sin exportarlos."""
-    count = 0
+def write_status(cfg, tag, res, dest):
     try:
-        mb = mailbox.mbox(str(mbox_path), create=False)
-        for msg in mb:
-            d = parse_email_date(msg)
-            if d and start_date <= d <= end_date:
-                count += 1
-        mb.close()
+        d = Path(dest) / "_estado"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{cfg['machine_name'].strip()}.json"
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        data[tag] = {"status": res["status"], "files": res["files"], "mails": res["mails"],
+                     "errors": res["errors"][:200], "when": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        f.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
-    return count
 
-def parse_email_date(msg) -> date | None:
-    """Extrae la fecha de un mensaje de email, tolerante a formatos raros."""
+
+# ------------------------------------------------------------------ FASE 1: recopilar (local)
+def local_dir(cfg, tag):
+    return Path(cfg["local_root"]) / cfg["machine_name"].strip() / tag
+
+
+def collect(cfg, y, m, prog, log, stop):
+    tag = f"{y}-{m:02d}"
+    start, end = month_range(y, m)
+    ts0, ts1 = start.timestamp(), end.timestamp()
+    dest_root = local_dir(cfg, tag)
+    lr = os.path.normcase(os.path.abspath(cfg["local_root"]))
+    errors = []
+
+    def err(msg):
+        errors.append(msg); log("  ERROR: " + msg)
+
+    users, extra, user_sources = resolve_all_sources(cfg, log)
+    log(f"== Recopilando {tag} — usuario(s) objetivo: {[u.name for u in users] or 'NINGUNO'}")
+    all_sources = [(Path(e).name or Path(e).drive.replace(":", ""), Path(e)) for e in extra] + user_sources
+
+    if not prog["files_done"]:
+        for label, sp in all_sources:
+            if not sp.is_dir():
+                log(f"(omitido, no existe) {sp}"); continue
+            log(f"Archivos: {sp}")
+            for root, dirs, files in os.walk(sp):
+                dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS
+                           and os.path.normcase(os.path.abspath(os.path.join(root, d))) != lr]
+                for f in files:
+                    if stop():
+                        raise Stopped()
+                    p = Path(root) / f
+                    try:
+                        st = p.stat()
+                        if not (ts0 <= st.st_mtime < ts1):
+                            continue
+                        out = dest_root / "Archivos" / label / p.relative_to(sp)
+                        if out.exists() and out.stat().st_size == st.st_size:
+                            continue
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        part = out.with_name(out.name + ".part")
+                        shutil.copy2(p, part)
+                        os.replace(part, out)
+                        prog["files"] += 1
+                    except Exception as e:
+                        err(f"Archivo {p}: {e}")
+        prog["files_done"] = not errors
+        save_prog(tag, prog)
+        log(f"  archivos nuevos copiados en total: {prog['files']}")
+
+    tb_list = resolve_thunderbird(cfg, users)
+    if tb_list:
+        for ulabel, tb in tb_list:
+            for sub in ("ImapMail", "Mail"):
+                base = Path(tb) / sub
+                if base.is_dir():
+                    backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
+                                start, end, prog, tag, log, err, stop)
+        prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
+        log(f"  correos respaldados: {prog['mails']}")
+    else:
+        err("No se encontró perfil de Thunderbird del usuario objetivo.")
+
+    prog["errors"] = errors
+    prog["collect_done"] = not errors
+    save_prog(tag, prog)
+
+
+# ------------------------------------------------------------------ correo (streaming + puntos de control)
+def is_mbox(p: Path):
+    if p.suffix.lower() in (".msf", ".dat", ".json", ".sqlite", ".html", ".txt", ".bak"):
+        return False
     try:
-        date_str = msg.get("Date", "")
-        if not date_str:
-            # Intentar con Received: que siempre tiene fecha
-            received = msg.get("Received", "")
-            if ";" in received:
-                date_str = received.split(";")[-1].strip()
-        if not date_str:
-            return None
-        # Limpiar parentesis al final: "Wed, 18 Feb 2026 10:26:17 -0600 (CST)"
-        date_str = date_str.split("(")[0].strip()
-        parsed = email.utils.parsedate_to_datetime(date_str)
-        return parsed.date()
+        with open(p, "rb") as fh:
+            return fh.read(5) == b"From "
     except Exception:
-        try:
-            # Ultimo intento: extraer fecha con parsedate
-            tup = email.utils.parsedate(msg.get("Date", ""))
-            if tup:
-                return date(tup[0], tup[1], tup[2])
-        except Exception:
-            pass
+        return False
+
+
+def _date_of(hdr, from_line):
+    try:
+        d = email.utils.parsedate_to_datetime(hdr.get("Date", ""))
+        return d.astimezone().replace(tzinfo=None) if d.tzinfo else d
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(from_line.decode("latin-1").split(None, 2)[2].strip(), "%a %b %d %H:%M:%S %Y")
+    except Exception:
         return None
 
-def _safe_header(value: str, max_len: int = 50) -> str:
-    """Limpia un header de correo para nombre de archivo. Rapido."""
-    if not value:
-        return ""
-    try:
-        parts = email.header.decode_header(value)
-        decoded = []
-        for part, enc in parts:
-            if isinstance(part, bytes):
-                decoded.append(part.decode(enc or "utf-8", errors="replace"))
-            else:
-                decoded.append(str(part))
-        value = " ".join(decoded)
-    except Exception:
-        pass
-    bad = set('/\\:*?"<>|')
-    value = "".join(c if c not in bad and ord(c) >= 32 else "_" for c in value)
-    return value[:max_len].strip(" .")
+
+def _h(fh, pos, n):
+    cur = fh.tell()
+    fh.seek(max(0, pos - n))
+    d = hashlib.sha1(fh.read(min(n, pos))).hexdigest()
+    fh.seek(cur)
+    return d
 
 
-def export_emails_to_eml(mbox_path: Path, dest_folder: Path,
-                          start_date: date, end_date: date,
-                          progress_cb=None) -> int:
-    """
-    Exporta correos del rango como .eml individuales.
-    - Lee el mbox una sola vez en memoria
-    - Filtra por fecha leyendo solo headers (no carga cuerpo ni adjuntos)
-    - Escribe en paralelo con ThreadPoolExecutor para maxima velocidad
-    """
-    import re as _re
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
-
-    dest_folder.mkdir(parents=True, exist_ok=True)
-
-    # Leer mbox — si esta bloqueado por Thunderbird, copiar a temp primero
-    import tempfile, shutil as _shutil
-    tmp_mbox = None
-    raw = None
-    try:
-        with open(mbox_path, "rb") as f:
-            raw = f.read()
-    except (PermissionError, OSError):
-        # Archivo bloqueado por Thunderbird — copiar a temporal y leer la copia
-        try:
-            if progress_cb:
-                progress_cb(f"  {mbox_path.name} esta en uso, copiando a temporal...")
-            tmp_mbox = Path(tempfile.gettempdir()) / f"respaldo_mbox_{mbox_path.name}_{os.getpid()}.tmp"
-            _shutil.copy2(str(mbox_path), str(tmp_mbox))
-            with open(tmp_mbox, "rb") as f:
-                raw = f.read()
-        except Exception as e2:
-            if progress_cb:
-                progress_cb(f"  Error leyendo {mbox_path.name}: {e2}")
-            if tmp_mbox and tmp_mbox.exists():
-                tmp_mbox.unlink(missing_ok=True)
-            return 0
-    except Exception as e:
-        if progress_cb:
-            progress_cb(f"  Error abriendo {mbox_path.name}: {e}")
-        return 0
-
-    # Dividir en bloques por separador mbox
-    posiciones = [m.start() for m in _re.finditer(rb"^From ", raw, _re.MULTILINE)]
-    posiciones.append(len(raw))
-    total = len(posiciones) - 1
-
-    if progress_cb:
-        progress_cb(f"  {mbox_path.name}: {total} mensajes en disco, filtrando...")
-
-    # ── Fase 1: Filtrar por fecha (solo headers, sin cuerpo) ──────────────
-    pendientes = []   # lista de (bloque_bytes, idx)
-    for idx in range(total):
-        bloque = raw[posiciones[idx]:posiciones[idx + 1]]
-        sep = bloque.find(b"\n\n")
-        if sep == -1:
-            sep = bloque.find(b"\r\n\r\n")
-        headers_raw = bloque[:sep] if sep != -1 else bloque[:3000]
-
-        try:
-            h = headers_raw.decode("utf-8", errors="replace")
-        except Exception:
-            h = headers_raw.decode("latin-1", errors="replace")
-
-        msg_date = None
-        for line in h.splitlines():
-            if line.lower().startswith("date:"):
-                ds = line[5:].strip().split("(")[0].strip()
-                try:
-                    msg_date = email.utils.parsedate_to_datetime(ds).date()
-                except Exception:
-                    try:
-                        tup = email.utils.parsedate(ds)
-                        if tup:
-                            msg_date = date(tup[0], tup[1], tup[2])
-                    except Exception:
-                        pass
-                break
-
-        if msg_date is None or not (start_date <= msg_date <= end_date):
-            continue
-
-        # Extraer From y Subject para nombre de archivo
-        remitente = "desconocido"
-        asunto    = "sin_asunto"
-        for line in h.splitlines():
-            ll = line.lower()
-            if ll.startswith("from:") and remitente == "desconocido":
-                fr = line[5:].strip()
-                raw_rem = fr.split("<")[0].strip().strip('"') if "<" in fr else fr.split("@")[0].strip()
-                remitente = _safe_header(raw_rem, 30) or "desconocido"
-            elif ll.startswith("subject:") and asunto == "sin_asunto":
-                asunto = _safe_header(line[8:].strip(), 60) or "sin_asunto"
-
-        pendientes.append((bloque, idx, msg_date, remitente, asunto))
-
-    if progress_cb:
-        progress_cb(f"  {mbox_path.name}: {len(pendientes)} correos del mes, escribiendo...")
-
-    if not pendientes:
-        return 0
-
-    # ── Fase 2: Generar nombres unicos ────────────────────────────────────
-    nombres_usados = set()
-    tareas = []
-    for bloque, idx, msg_date, remitente, asunto in pendientes:
-        base  = f"{msg_date.isoformat()} - {remitente} - {asunto}"
-        fname = base + ".eml"
-        if fname in nombres_usados:
-            fname = f"{base} ({idx}).eml"
-        nombres_usados.add(fname)
-        tareas.append((dest_folder / fname, bloque))
-
-    # ── Fase 3: Escritura en paralelo ─────────────────────────────────────
-    exported  = 0
-    errores   = 0
-    lock      = threading.Lock()
-
-    # Usar max 8 hilos — mas no mejora en disco local de Windows
-    workers = min(8, len(tareas))
-
-    def escribir(args):
-        path, data = args
-        path.write_bytes(data)
-        return True
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futuros = {ex.submit(escribir, t): t for t in tareas}
-        done = 0
-        for fut in as_completed(futuros):
-            done += 1
-            try:
-                fut.result()
-                with lock:
-                    exported += 1
-            except Exception as e:
-                with lock:
-                    errores += 1
-            if progress_cb and done % 50 == 0:
-                progress_cb(f"  {done}/{len(tareas)} correos escritos de {mbox_path.name}...")
-
-    if progress_cb:
-        msg = f"  {mbox_path.name}: {exported} correos exportados"
-        if errores:
-            msg += f" ({errores} errores)"
-        progress_cb(msg)
-
-    # Limpiar temporal si se creo
-    if tmp_mbox and tmp_mbox.exists():
-        tmp_mbox.unlink(missing_ok=True)
-
-    return exported
-
-def backup_thunderbird(tmp_root: Path, start_date: date, end_date: date,
-                        include_profile_copy: bool = True,
-                        progress_cb=None) -> dict:
-    """
-    Respaldo completo de Thunderbird:
-    1. Copia la carpeta de perfil completa  ->  tmp_root/Correos/perfil_completo/
-    2. Exporta .eml por rango de fechas     ->  tmp_root/Correos/eml/INBOX/ y /Enviados/
-    NOTA: Solo exporta los correos que Thunderbird tiene descargados en disco.
-    Si la cuenta es IMAP (Gmail etc.) puede que no esten todos descargados.
-    """
-    result = {"profile_copied": False, "eml_inbox": 0, "eml_sent": 0, "error": None}
-
-    profile = find_thunderbird_profile()
-    if profile is None:
-        result["error"] = "Perfil de Thunderbird no encontrado"
-        if progress_cb:
-            progress_cb("  Thunderbird no encontrado, omitiendo correos.")
-        return result
-
-    if progress_cb:
-        progress_cb(f"  Perfil: {profile.name}")
-
-    # 1. Copia completa del perfil
-    if include_profile_copy:
-        dest_profile = tmp_root / "Correos" / "perfil_completo"
-        try:
-            if progress_cb:
-                progress_cb("  Copiando perfil completo de Thunderbird...")
-            shutil.copytree(str(profile), str(dest_profile),
-                            ignore=shutil.ignore_patterns("*.log", "cache2", "Cache",
-                                                          "shader-cache", "datareporting"),
-                            dirs_exist_ok=True)
-            result["profile_copied"] = True
-            if progress_cb:
-                progress_cb("  Perfil copiado OK")
-        except Exception as e:
-            result["error"] = str(e)
-            if progress_cb:
-                progress_cb(f"  Advertencia copiando perfil: {e}")
-
-    # 2. Exportar .eml por rango
-    mbox_files = find_mbox_files(profile)
-    if not mbox_files:
-        if progress_cb:
-            progress_cb("  Advertencia: no se encontraron archivos de correo de Thunderbird")
-            progress_cb("  Verifica que Thunderbird este configurado para descargar correos offline")
-        return result
-
-    if progress_cb:
-        progress_cb(f"  Archivos de correo encontrados: {len(mbox_files)}")
-        for mbox_path, name in mbox_files:
-            size_mb = mbox_path.stat().st_size / 1024 / 1024
-            n_mes = count_emails_in_mbox(mbox_path, start_date, end_date)
-            progress_cb(f"    {name}: {size_mb:.1f} MB  |  {n_mes} correos del mes en disco")
-
-    for mbox_path, folder_name in mbox_files:
-        if progress_cb:
-            progress_cb(f"  Exportando: {folder_name}...")
-        dest_eml = tmp_root / "Correos" / "eml" / folder_name
-        count = export_emails_to_eml(mbox_path, dest_eml, start_date, end_date, progress_cb)
-        if progress_cb:
-            progress_cb(f"  {count} correos exportados de {folder_name}")
-        name_upper = folder_name.upper()
-        if "SENT" in name_upper or "ENVIADO" in name_upper:
-            result["eml_sent"] += count
+def filter_mbox(src, out, ids_path, start, end, seen, st, save, stop):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ids_path.parent.mkdir(parents=True, exist_ok=True)
+    n, fout, new_ids, buf = 0, None, [], []
+    with open(src, "rb") as fh:
+        head = hashlib.sha1(fh.read(4096)).hexdigest()
+        off = st.get("offset", 0)
+        valid = (off > 0 and st.get("head") == head and os.path.getsize(src) >= off
+                 and _h(fh, off, 128) == st.get("tail")
+                 and (st.get("out_size", 0) == 0 or (out.exists() and out.stat().st_size >= st["out_size"])))
+        if valid:
+            if out.exists():
+                with open(out, "r+b") as f:
+                    f.truncate(st.get("out_size", 0))
+            if ids_path.exists():
+                with open(ids_path, "r+b") as f:
+                    f.truncate(st.get("ids_size", 0))
+                seen.update(x.strip() for x in ids_path.read_text(encoding="utf-8").splitlines() if x.strip())
+            n = st.get("count", 0)
         else:
-            result["eml_inbox"] += count
-
-    return result
-
-# ───────────────────────────────────────────────
-def _user_file(name: str) -> Path:
-    """Archivo en la carpeta del usuario local (no del admin)."""
-    userprofile = os.environ.get("USERPROFILE", "")
-    base = Path(userprofile) if userprofile and Path(userprofile).exists() else Path.home()
-    return base / name
-
-CONFIG_FILE = _user_file(".respaldo_mensual.json")
-LOG_FILE    = _user_file("respaldo_mensual.log")
-
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("respaldo")
-
-# ───────────────────────────────────────────────
-#  Utilidades generales
-# ───────────────────────────────────────────────
-
-def get_pc_number() -> str:
-    """Extrae el número de la PC del nombre de host (ulapcXX → XX)."""
-    hostname = socket.gethostname().upper()
-    digits = "".join(c for c in hostname if c.isdigit())
-    return digits if digits else "00"
-
-def get_pc_label() -> str:
-    return f"LAPC {get_pc_number()}"
-
-def get_default_folders():
-    home = Path.home()
-    return {
-        "Escritorio": home / "Desktop",
-        "Descargas":  home / "Downloads",
-        "Documentos": home / "Documents",
-        "Imágenes":   home / "Pictures",
-    }
-
-def last_day_of_month(d: date) -> date:
-    return d.replace(day=calendar.monthrange(d.year, d.month)[1])
-
-def first_business_day_of_month(d: date) -> date:
-    """Primer dia habil del mes: lunes a sabado. Si dia 1 es domingo, retorna dia 2."""
-    first = d.replace(day=1)
-    if first.weekday() == 6:  # domingo
-        return first + timedelta(days=1)
-    return first
-
-def is_within_backup_window(d: date = None) -> bool:
-    """
-    Devuelve True si hoy esta dentro de la ventana de respaldo del mes.
-    La ventana es: desde el 1er dia habil hasta los primeros MAX_REINTENTOS_HABILES
-    dias habiles del mes (lunes a sabado, sin domingos).
-    Ejemplo con MAX=5: si el dia 1 es martes, la ventana es mar-mie-jue-vie-sab-lun
-    """
-    d = d or date.today()
-    # Solo aplica en los primeros dias del mes
-    if d.day > 14:  # margen para cubrir 9 dias habiles incluyendo domingos
-        return False
-    primer_habil = first_business_day_of_month(d)
-    if d < primer_habil:
-        return False
-    # Contar dias habiles desde el primero hasta hoy
-    habiles = 0
-    cur = primer_habil
-    while cur <= d:
-        if cur.weekday() != 6:  # no domingo
-            habiles += 1
-        cur += timedelta(days=1)
-    return habiles <= MAX_REINTENTOS_HABILES
-
-def is_first_business_day_of_month(d: date = None) -> bool:
-    d = d or date.today()
-    return d == first_business_day_of_month(d)
-
-def month_range(d: date = None):
-    """Devuelve (primer día, último día) del mes anterior."""
-    d = d or date.today()
-    first_this = d.replace(day=1)
-    last_prev  = first_this - timedelta(days=1)
-    first_prev = last_prev.replace(day=1)
-    return first_prev, last_prev
-
-# ───────────────────────────────────────────────
-#  Configuración persistente
-# ───────────────────────────────────────────────
-
-DEFAULT_CFG = {
-    "share_root":         r"\\ULAPC46\Respaldos",
-    "retry_pending":      False,
-    "last_backup":        "",
-    "backup_thunderbird": True,
-    "tb_profile_copy":    True,
-}
-
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            return {**DEFAULT_CFG, **cfg}
-        except Exception:
-            pass
-    return dict(DEFAULT_CFG)
-
-def save_config(cfg: dict):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-# ───────────────────────────────────────────────
-#  Recolección de archivos
-# ───────────────────────────────────────────────
-
-EXCLUIR_EXTENSIONES = {".lnk", ".tmp", ".temp", ".ini"}
-
-def file_in_range(path: Path, start: date, end: date) -> bool:
-    try:
-        if path.suffix.lower() in EXCLUIR_EXTENSIONES:
-            return False
-        mtime = datetime.fromtimestamp(path.stat().st_mtime).date()
-        return start <= mtime <= end
-    except Exception:
-        return False
-
-def collect_files(start_date: date, end_date: date, progress_cb=None):
-    collected = []
-    for folder_name, folder_path in get_default_folders().items():
-        if not folder_path.exists():
-            continue
-        for root, dirs, files in os.walk(folder_path):
-            dirs[:] = [d for d in dirs if not d.startswith("RESPALDO_")]
-            for fname in files:
-                fpath = Path(root) / fname
-                if fpath.is_file() and file_in_range(fpath, start_date, end_date):
-                    collected.append((fpath, folder_name))
-        if progress_cb:
-            progress_cb(f"Escaneado: {folder_name}")
-    return collected
-
-# ───────────────────────────────────────────────
-#  Copia local temporal
-# ───────────────────────────────────────────────
-
-def build_local_backup(files, tmp_root: Path, status_cb=None, count_cb=None):
-    errors = []
-    total = len(files)
-    folders = get_default_folders()
-    for i, (fpath, folder_name) in enumerate(files, 1):
-        try:
-            base = folders.get(folder_name, fpath.parent)
-            try:
-                rel = fpath.relative_to(base)
-            except ValueError:
-                rel = Path(fpath.name)
-            dest = tmp_root / folder_name / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                stem, suffix, c = dest.stem, dest.suffix, 1
-                while dest.exists():
-                    dest = dest.parent / f"{stem}_{c}{suffix}"
-                    c += 1
-            shutil.copy2(fpath, dest)
-            if status_cb:
-                status_cb(f"  [{i}/{total}] {fpath.name}")
-            if count_cb:
-                count_cb(i, total)
-        except Exception as e:
-            errors.append((str(fpath), str(e)))
-    return errors
-
-# ───────────────────────────────────────────────
-#  Copia a la red local Windows
-# ───────────────────────────────────────────────
-
-def copy_to_network(local_backup: Path, net_dest: Path, status_cb=None) -> int:
-    """Copia la carpeta completa de respaldo a la ruta de red."""
-    net_dest.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    for src in local_backup.rglob("*"):
-        if not src.is_file():
-            continue
-        rel  = src.relative_to(local_backup)
-        dest = net_dest / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
-        copied += 1
-        if status_cb and copied % 20 == 0:
-            status_cb(f"  Red: {copied} archivos enviados...")
-    return copied
-
-# ───────────────────────────────────────────────
-#  Lógica central del respaldo
-# ───────────────────────────────────────────────
-
-def _escribir_estado_red(cfg: dict, pc_label: str, mes: str, status: str,
-                         archivos: int, errores: list,
-                         net_dest: str = "", detalle: str = ""):
-    """Escribe el estado del respaldo en la carpeta de informes de la red."""
-    try:
-        share = cfg.get("share_root", "")
-        if not share:
-            return
-        ruta_informes = str(Path(share) / "_informes")
-        # Importar y llamar la funcion del script de informe si existe
-        import importlib.util, socket as _socket, json as _json
-        from datetime import datetime as _dt
-        carpeta = Path(ruta_informes)
-        carpeta.mkdir(parents=True, exist_ok=True)
-        nombre = f"{pc_label.replace(' ', '_')}_{mes}.json"
-        estado = {
-            "pc":        pc_label,
-            "mes":       mes,
-            "status":    status,
-            "archivos":  archivos,
-            "errores":   len(errores) if errores else 0,
-            "net_dest":  net_dest,
-            "detalle":   detalle,
-            "timestamp": _dt.now().isoformat(),
-            "hostname":  _socket.gethostname(),
-        }
-        with open(carpeta / nombre, "w", encoding="utf-8") as f:
-            _json.dump(estado, f, indent=2, ensure_ascii=False)
-        log.info(f"Estado del respaldo escrito en: {carpeta / nombre}")
-    except Exception as e:
-        log.warning(f"No se pudo escribir estado en red: {e}")
-
-
-# ───────────────────────────────────────────────
-#  Sistema de checkpoint y reintentos
-# ───────────────────────────────────────────────
-
-MAX_REINTENTOS_HABILES = 9  # dias habiles maximos (semana y media: lun-sab)
-
-def _checkpoint_path(month_label: str) -> Path:
-    return _user_file(f".respaldo_checkpoint_{month_label}.json")
-
-def _load_checkpoint(month_label: str) -> dict:
-    """Carga el checkpoint del mes. Si no existe devuelve estado inicial."""
-    p = _checkpoint_path(month_label)
-    if p.exists():
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "month":           month_label,
-        "fase":            "inicio",   # inicio | archivos | correos | red | completo
-        "archivos_ok":     [],          # rutas ya copiadas
-        "correos_ok":      [],          # carpetas de correo ya exportadas
-        "perfil_ok":       False,
-        "red_ok":          False,
-        "intentos":        0,
-        "dias_habiles_usados": 0,
-        "ultimo_intento":  "",
-        "fallido":         False,
-    }
-
-def _save_checkpoint(cp: dict):
-    p = _checkpoint_path(cp["month"])
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(cp, f, indent=2, ensure_ascii=False)
-
-def _delete_checkpoint(month_label: str):
-    _checkpoint_path(month_label).unlink(missing_ok=True)
-
-def _dias_habiles_entre(d1: date, d2: date) -> int:
-    """Cuenta dias habiles (lun-sab) entre dos fechas."""
-    count = 0
-    current = d1
-    while current <= d2:
-        if current.weekday() != 6:  # no domingo
-            count += 1
-        current += timedelta(days=1)
-    return count
-
-def _puede_reintentar(cp: dict) -> tuple:
-    """
-    Devuelve (puede, motivo).
-    No puede si: ya esta completo, marcado fallido, o supero MAX dias habiles.
-    """
-    if cp.get("fallido"):
-        return False, "Marcado como fallido definitivo"
-    if cp.get("red_ok") or cp.get("fase") == "completo":
-        return False, "Ya completado"
-    # Contar dias habiles usados desde el primer intento
-    if cp.get("ultimo_intento"):
-        try:
-            primer = date.fromisoformat(cp["ultimo_intento"][:10])
-            dias = _dias_habiles_entre(primer, date.today())
-            if dias > MAX_REINTENTOS_HABILES:
-                return False, f"Supero {MAX_REINTENTOS_HABILES} dias habiles de reintento"
-        except Exception:
-            pass
-    return True, "OK"
-
-def run_backup(cfg: dict, status_cb=None, count_cb=None) -> dict:
-    def msg(text, level="info"):
-        getattr(log, level)(text)
-        if status_cb:
-            status_cb(text)
-
-    start_d, end_d = month_range()
-    pc_label       = get_pc_label()
-    month_label    = start_d.strftime("%Y-%m")
-    backup_name    = f"RESPALDO_{pc_label.replace(' ', '_')}_{month_label}"
-    # Carpeta temporal en ProgramData (no visible para el usuario normal)
-    local_backup   = Path(os.environ.get("ProgramData", "C:/ProgramData")) / "RespaldoSistema" / backup_name
-    share_root     = cfg["share_root"].strip()
-    net_dest       = Path(share_root) / pc_label / month_label
-
-    # ── Cargar checkpoint del mes ──────────────────────────────────────
-    cp = _load_checkpoint(month_label)
-
-    # Verificar si puede reintentar
-    puede, motivo = _puede_reintentar(cp)
-    if not puede:
-        msg(f"Respaldo cancelado: {motivo}")
-        if cp.get("fallido"):
-            _escribir_estado_red(cfg, pc_label, month_label, "error",
-                                 0, [], str(net_dest), motivo)
-        return {"status": "cancelado", "motivo": motivo}
-
-    # Actualizar contadores del checkpoint
-    cp["intentos"]       += 1
-    cp["ultimo_intento"]  = str(date.today())
-    if cp["intentos"] > 1:
-        dias = _dias_habiles_entre(
-            date.fromisoformat(cp.get("primer_intento", str(date.today()))[:10]),
-            date.today()
-        )
-        cp["dias_habiles_usados"] = dias
-        if dias >= MAX_REINTENTOS_HABILES:
-            cp["fallido"] = True
-            _save_checkpoint(cp)
-            msg(f"Respaldo fallido: supero {MAX_REINTENTOS_HABILES} dias habiles de reintento.")
-            _escribir_estado_red(cfg, pc_label, month_label, "error",
-                                 0, [], str(net_dest),
-                                 f"Supero {MAX_REINTENTOS_HABILES} dias habiles")
-            return {"status": "fallido"}
-    else:
-        cp["primer_intento"] = str(date.today())
-
-    _save_checkpoint(cp)
-
-    msg(f"Iniciando respaldo  {pc_label}  -  {month_label}")
-    msg(f"Rango: {start_d}  a  {end_d}")
-    msg(f"Destino en red: {net_dest}")
-    if cp["intentos"] > 1:
-        msg(f"Reintento {cp['intentos']} (dia habil {cp['dias_habiles_usados']}/{MAX_REINTENTOS_HABILES})")
-        msg(f"Retomando desde fase: {cp['fase']}")
-
-    errors = []
-
-    # ── FASE 1: Archivos locales ───────────────────────────────────────
-    if cp["fase"] in ("inicio", "archivos"):
-        cp["fase"] = "archivos"
-        _save_checkpoint(cp)
-
-        msg("Buscando archivos...")
-        files = collect_files(start_d, end_d, status_cb)
-        msg(f"{len(files)} archivos encontrados.")
-
-        # Crear carpeta si no existe (puede existir de intento anterior)
-        local_backup.mkdir(parents=True, exist_ok=True)
-
-        # Filtrar archivos ya copiados en intentos anteriores
-        ya_copiados = set(cp.get("archivos_ok", []))
-        pendientes  = [(f, n) for f, n in files if str(f) not in ya_copiados]
-
-        if pendientes:
-            msg(f"  {len(ya_copiados)} ya copiados, {len(pendientes)} pendientes...")
-            for fpath, folder_name in pendientes:
-                try:
-                    folders = get_default_folders()
-                    base    = folders.get(folder_name, fpath.parent)
-                    try:    rel = fpath.relative_to(base)
-                    except: rel = Path(fpath.name)
-                    dest = local_backup / folder_name / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    if dest.exists():
-                        stem, suffix, c = dest.stem, dest.suffix, 1
-                        while dest.exists():
-                            dest = dest.parent / f"{stem}_{c}{suffix}"; c += 1
-                    shutil.copy2(fpath, dest)
-                    cp["archivos_ok"].append(str(fpath))
-                    _save_checkpoint(cp)
-                except Exception as e:
-                    errors.append((str(fpath), str(e)))
-        else:
-            msg("  Todos los archivos ya estaban copiados.")
-        cp["fase"] = "correos"
-        _save_checkpoint(cp)
-
-    # ── FASE 2: Thunderbird ────────────────────────────────────────────
-    if cp["fase"] == "correos":
-        if cfg.get("backup_thunderbird", True):
-            msg("Procesando correos de Thunderbird...")
-            ya_correos = set(cp.get("correos_ok", []))
-            profile    = find_thunderbird_profile()
-            if profile:
-                mbox_files = find_mbox_files(profile)
-                pendientes_tb = [(p, n) for p, n in mbox_files if n not in ya_correos]
-                if cp.get("perfil_ok") is False and cfg.get("tb_profile_copy", True):
-                    # Copiar perfil completo si no se hizo
-                    try:
-                        dest_profile = local_backup / "Correos" / "perfil_completo"
-                        if not dest_profile.exists():
-                            msg("  Copiando perfil completo de Thunderbird...")
-                            shutil.copytree(str(profile), str(dest_profile),
-                                ignore=shutil.ignore_patterns("*.log","cache2","Cache",
-                                                               "shader-cache","datareporting"),
-                                dirs_exist_ok=True)
-                        cp["perfil_ok"] = True
-                        _save_checkpoint(cp)
-                    except Exception as e:
-                        msg(f"  Advertencia perfil: {e}")
-
-                for mbox_path, folder_name in pendientes_tb:
-                    msg(f"  Exportando: {folder_name}...")
-                    dest_eml = local_backup / "Correos" / "eml" / folder_name
-                    count = export_emails_to_eml(
-                        mbox_path, dest_eml, start_d, end_d, status_cb)
-                    msg(f"  {count} correos exportados de {folder_name}")
-                    cp["correos_ok"].append(folder_name)
-                    _save_checkpoint(cp)
-            else:
-                msg("  Thunderbird no encontrado.")
-        cp["fase"] = "red"
-        _save_checkpoint(cp)
-
-    # ── FASE 3: Copiar a la red ────────────────────────────────────────
-    if cp["fase"] == "red":
-        # Verificar si la carpeta ya existe en la red con archivos (intento anterior completo)
-        try:
-            red_tiene_archivos = net_dest.exists() and any(net_dest.rglob("*"))
-        except Exception:
-            red_tiene_archivos = False
-
-        if red_tiene_archivos:
-            msg(f"La carpeta ya existe en la red: {net_dest}")
-            msg("Ya fue copiada anteriormente. Marcando como completado.")
-            cp["red_ok"] = True
-            cp["fase"]   = "completo"
-            _save_checkpoint(cp)
-            cfg["retry_pending"] = False
-            save_config(cfg)
-        else:
-            msg(f"Enviando a la red: {net_dest}")
-            try:
-                net_files = copy_to_network(local_backup, net_dest, status_cb)
-                msg(f"{net_files} archivos enviados correctamente a la red.")
-                cp["red_ok"] = True
-                cp["fase"]   = "completo"
-                _save_checkpoint(cp)
-                cfg["retry_pending"] = False
-            except Exception as e:
-                log.error(f"Error de red: {e}")
-                cfg["retry_pending"] = True
-                save_config(cfg)
-                _save_checkpoint(cp)
-                raise RuntimeError(
-                    f"No se pudo copiar a la red.\n"
-                    f"Ruta: {net_dest}\n"
-                    f"Detalle: {e}\n"
-                    f"Se reintentara en el siguiente trigger.")
-
-    # ── Finalizar ──────────────────────────────────────────────────────
-    total_archivos = len(cp.get("archivos_ok", []))
-    cfg["last_backup"]        = str(date.today())
-    cfg["last_backup_month"]  = month_label   # mes que se respaldo (ej. "2026-03")
-    cfg["retry_pending"]      = False
-    save_config(cfg)
-    msg("Respaldo completado exitosamente.")
-
-    # Borrar carpeta local del Escritorio
-    try:
-        shutil.rmtree(local_backup)
-        msg(f"Carpeta local eliminada: {local_backup.name}")
-    except Exception as e:
-        msg(f"Advertencia: no se pudo eliminar carpeta local: {e}")
-
-    # Borrar checkpoint (tarea completada)
-    _delete_checkpoint(month_label)
-
-    # Escribir estado en informes de red
-    _escribir_estado_red(cfg, pc_label, month_label, "ok",
-                         total_archivos, errors, str(net_dest))
-
-    return {"status": "ok", "local_backup": str(local_backup),
-            "net_dest": str(net_dest), "files": total_archivos, "errors": errors}
-
-# ───────────────────────────────────────────────
-#  Comprobación al arrancar (retry pendiente)
-# ───────────────────────────────────────────────
-
-def check_and_run_headless():
-    """
-    Llamado por Task Scheduler sin GUI.
-    - Verifica lock file para no correr si ya hay un respaldo en curso
-    - Corre si es el primer dia habil del mes O hay retry pendiente
-    - Si ya corrio exitosamente hoy, no vuelve a correr
-    """
-    cfg   = load_config()
-    today = date.today()
-
-    # Calcular mes a respaldar
-    start_d, _ = month_range()
-    month_label = start_d.strftime("%Y-%m")
-
-    # Verificar si este mes ya fue respaldado exitosamente (guardado en config)
-    if cfg.get("last_backup_month") == month_label:
-        log.info(f"El mes {month_label} ya fue respaldado exitosamente. Nada que hacer.")
-        return
-
-    # Verificar checkpoint del mes
-    cp = _load_checkpoint(month_label)
-
-    # Checkpoint dice que ya completo
-    if cp.get("fase") == "completo" or cp.get("red_ok"):
-        log.info(f"Respaldo de {month_label} ya completado (checkpoint).")
-        # Actualizar config para no volver a revisar
-        cfg["last_backup_month"] = month_label
-        save_config(cfg)
-        return
-
-    # Fallido definitivo
-    if cp.get("fallido"):
-        log.error(f"Respaldo de {month_label} marcado como fallido definitivo.")
-        return
-
-    # Ver si debe correr hoy
-    # Verificar si estamos dentro de la ventana de respaldo
-    # (primeros MAX_REINTENTOS_HABILES dias habiles del mes)
-    en_ventana    = is_within_backup_window(today)
-    tiene_pendiente = cfg.get("retry_pending", False) or (
-        cp.get("fase", "inicio") not in ("inicio", "completo")
-    )
-
-    if not en_ventana and not tiene_pendiente:
-        log.info(f"Hoy ({today}) esta fuera de la ventana de respaldo "
-                 f"(primeros {MAX_REINTENTOS_HABILES} dias habiles del mes).")
-        return
-
-    log.info(f"Hoy ({today}) esta dentro de la ventana de respaldo.")
-
-    if not cfg.get("share_root"):
-        log.error("Ruta de red no configurada.")
-        return
-
-    # Lock file: evita que dos instancias corran al mismo tiempo
-    lock_file = _user_file(".respaldo_en_curso.lock")
-    if lock_file.exists():
-        # Verificar si el lock es de hoy y reciente (menos de 4 horas)
-        try:
-            import time
-            lock_age_hours = (time.time() - lock_file.stat().st_mtime) / 3600
-            if lock_age_hours < 4:
-                log.info(f"Respaldo ya en curso (lock de hace {lock_age_hours:.1f}h). Esperando siguiente trigger.")
+            off = 0
+            out.unlink(missing_ok=True); ids_path.unlink(missing_ok=True)
+
+        def flush_ids():
+            if new_ids:
+                with open(ids_path, "a", encoding="utf-8") as f:
+                    f.write("\n".join(new_ids) + "\n")
+                new_ids.clear()
+
+        def checkpoint(boundary):
+            flush_ids()
+            if fout:
+                fout.flush(); os.fsync(fout.fileno())
+            st.update(offset=boundary, count=n, head=head, tail=_h(fh, boundary, 128),
+                      out_size=out.stat().st_size if out.exists() else 0,
+                      ids_size=ids_path.stat().st_size if ids_path.exists() else 0)
+            save()
+
+        def flush():
+            nonlocal n, fout
+            if not buf:
                 return
-            else:
-                # Lock viejo (mas de 4h) = proceso anterior colgado, eliminar
-                log.warning(f"Lock file viejo ({lock_age_hours:.1f}h), eliminando y reintentando.")
-                lock_file.unlink(missing_ok=True)
-        except Exception:
-            lock_file.unlink(missing_ok=True)
+            cut = next((i for i, l in enumerate(buf) if i > 0 and l.strip() == b""), len(buf))
+            hdr = BytesParser().parsebytes(b"".join(buf[1:cut]), headersonly=True)
+            try:
+                if int(hdr.get("X-Mozilla-Status", "0").strip() or "0", 16) & 0x0008:
+                    return
+            except ValueError:
+                pass
+            d = _date_of(hdr, buf[0])
+            if d is None or not (start <= d < end):
+                return
+            mid = " ".join((hdr.get("Message-ID") or "").split())
+            if mid:
+                if mid in seen:
+                    return
+                seen.add(mid); new_ids.append(mid)
+            if fout is None:
+                fout = open(out, "ab")
+            fout.writelines(buf)
+            if not buf[-1].endswith(b"\n"):
+                fout.write(b"\n")
+            if buf[-1].strip():
+                fout.write(b"\n")
+            n += 1
 
-    # Crear lock file
+        try:
+            fh.seek(off)
+            pos, prev_blank, last_ck = off, True, time.time()
+            while True:
+                line = fh.readline()
+                if not line:
+                    break
+                if prev_blank and line.startswith(b"From "):
+                    flush()
+                    if time.time() - last_ck >= CK_SECONDS:
+                        checkpoint(pos); last_ck = time.time()
+                        if stop():
+                            raise Stopped()
+                    buf = [line]
+                else:
+                    buf.append(line)
+                prev_blank = (line.strip() == b"")
+                pos += len(line)
+            flush()
+            flush_ids()
+            st.update(done=True, count=n, offset=pos)
+            save()
+        finally:
+            if fout:
+                fout.close()
+    return n
+
+
+def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
+    seen_cache = {}
+    ids_dir = PROG_DIR / f"{tag}_ids"
+
+    def ids_file(key):
+        return ids_dir / (re.sub(r"[^\w.\-]+", "_", key) + ".txt")
+
+    def seen_for(acct):
+        if acct not in seen_cache:
+            s = set()
+            for k, v in prog["mail"].items():
+                if v.get("done") and k.startswith(acct + "/") and ids_file(k).exists():
+                    s.update(x.strip() for x in ids_file(k).read_text(encoding="utf-8").splitlines() if x.strip())
+            seen_cache[acct] = s
+        return seen_cache[acct]
+
+    for root, dirs, files in os.walk(base):
+        rel = Path(root).relative_to(base)
+        parts = [x[:-4] if x.lower().endswith(".sbd") else x for x in rel.parts]
+        dirs[:] = sorted(d for d in dirs if (d[:-4] if d.lower().endswith(".sbd") else d).lower() not in SKIP_MAIL)
+        if any(x.lower() in SKIP_MAIL for x in parts):
+            continue
+        acct = f"{sub}/{parts[0]}" if parts else sub
+        for f in sorted(files):
+            p = Path(root) / f
+            if f.lower() in SKIP_MAIL or not is_mbox(p):
+                continue
+            key = "/".join([sub] + parts + [f])
+            st = prog["mail"].setdefault(key, {})
+            if st.get("done"):
+                continue
+            try:
+                if not st.get("offset") and p.stat().st_mtime < start.timestamp():
+                    st.update(done=True, count=0); continue
+                log(f"  Buzón {key}" + (" (retomando)" if st.get("offset") else ""))
+                c = filter_mbox(p, out_base.joinpath(*parts) / (f + ".mbox"), ids_file(key), start, end,
+                                seen_for(acct), st, lambda: save_prog(tag, prog), stop)
+                if c:
+                    log(f"    {c} correos")
+            except Stopped:
+                raise
+            except Exception as e:
+                err(f"Correo {key}: {e}")
+    save_prog(tag, prog)
+
+
+# ------------------------------------------------------------------ Credenciales de red para SYSTEM
+def _host_from_dest(dest):
+    """Extrae el host (nombre o IP) de una ruta UNC."""
+    p = dest.strip()
+    if p.startswith("\\\\"):
+        return p[2:].split("\\")[0]
+    return None
+
+
+def save_net_credentials_for_system(host, user, password, log=None):
+    """
+    Guarda las credenciales en el almacén de Windows del usuario SYSTEM.
+    La tarea programada corre como SYSTEM, que tiene su propio almacén de
+    credenciales separado del usuario normal — por eso 'guardar con cmdkey'
+    desde tu sesión normal NO sirve para el servicio.
+
+    Técnica: crea una tarea temporal que corre cmdkey como SYSTEM y la
+    ejecuta de inmediato. Borra la tarea al terminar.
+    """
+    if os.name != "nt":
+        return True, ""
+    if not host or not user:
+        return False, "Host o usuario vacíos"
+    task = "RespaldoCredTemp"
+    cmd  = f'cmdkey /add:{host} /user:{user} /pass:{password}'
     try:
-        lock_file.write_text(str(os.getpid()), encoding="utf-8")
+        # Crear tarea de un solo disparo como SYSTEM
+        subprocess.run(
+            ["schtasks", "/create", "/f", "/tn", task, "/sc", "once",
+             "/st", "00:00", "/ru", "SYSTEM",
+             "/tr", cmd],
+            capture_output=True, check=True)
+        # Ejecutar inmediatamente
+        subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, check=True)
+        # Esperar hasta 5 s a que termine
+        for _ in range(10):
+            time.sleep(0.5)
+            r = subprocess.run(["schtasks", "/query", "/tn", task, "/fo", "csv"],
+                               capture_output=True, text=True)
+            if "Ready" in r.stdout or "Listo" in r.stdout:
+                break
+        # Borrar la tarea temporal
+        subprocess.run(["schtasks", "/delete", "/f", "/tn", task], capture_output=True)
+        if log:
+            log(f"Credenciales de SYSTEM guardadas para {host} (usuario: {user})")
+        return True, ""
+    except subprocess.CalledProcessError as e:
+        msg = f"No se pudieron guardar las credenciales: {e}"
+        if log:
+            log(f"  ⚠ {msg}")
+        return False, msg
+
+
+def mount_net_path(dest, user, password, log=None):
+    """
+    Intenta montar la ruta de red usando 'net use' antes de copiar.
+    Esto funciona tanto para el usuario normal como para SYSTEM.
+    Si ya tiene acceso sin credenciales, 'net use' simplemente confirma la conexión.
+    """
+    if os.name != "nt":
+        return
+    host = _host_from_dest(dest)
+    if not host:
+        return
+    # Ruta base del servidor (\\IP o \\nombre)
+    unc_base = f"\\\\{host}"
+    try:
+        args = ["net", "use", unc_base]
+        if user:
+            args += [f"/user:{user}", password or ""]
+        args += ["/persistent:no"]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            if log:
+                log(f"Conexión con {unc_base} establecida correctamente")
+        elif "ya existe" in r.stdout.lower() or "already" in r.stdout.lower():
+            pass  # ya conectado
+        else:
+            if log:
+                log(f"  net use devolvió: {(r.stdout + r.stderr).strip()[:200]}")
+    except Exception as e:
+        if log:
+            log(f"  net use falló: {e}")
+
+
+# ------------------------------------------------------------------ FASE 2: enviar a PC100
+def send(cfg, tag, log):
+    src = local_dir(cfg, tag)
+    if not src.exists():
+        return True, None, ""
+    why = "Sin destinos configurados"
+    user     = cfg.get("net_user", "").strip()
+    password = cfg.get("net_pass", "").strip()
+    for dest in destinations(cfg):
+        # Intentar establecer la conexión de red con credenciales antes de verificar acceso
+        mount_net_path(dest, user, password, log)
+        ok, why = dest_reachable(dest)
+        if not ok:
+            log(f"  {why}"); continue
+        dst = Path(dest) / cfg["machine_name"].strip() / tag
+        log(f"Enviando a {dst}")
+        try:
+            if shutil.which("robocopy"):
+                rl = CFG_DIR / "robocopy.log"
+                # Robocopy acepta credenciales implícitamente si la conexión ya está montada.
+                # /Z = modo reiniciable (retoma archivos parciales si se corta la red)
+                with open(rl, "w") as lf:
+                    rc = subprocess.call(
+                        ["robocopy", str(src), str(dst),
+                         "/E", "/COPY:DAT", "/R:3", "/W:10", "/Z",
+                         "/NP", "/NDL", "/NFL", "/NJH"],
+                        stdout=lf, stderr=lf)
+                if rc >= 8:
+                    why = f"robocopy código {rc}: " + rl.read_text(errors="replace")[-300:]
+                    log("  " + why); continue
+            else:
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            return True, dest, ""
+        except PermissionError as e:
+            why = (f"Sin permisos en {dest}. "
+                   f"Verifica que el usuario '{user or 'anónimo'}' tenga acceso de escritura "
+                   f"a la carpeta compartida de PC100. Detalle: {e}")
+            log("  " + why)
+        except Exception as e:
+            why = f"Envío a {dest}: {e}"; log("  " + why)
+    return False, None, why
+
+
+# ------------------------------------------------------------------ trabajo completo
+def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
+    tag = f"{y}-{m:02d}"
+    if not acquire_lock():
+        log("Ya hay un respaldo en curso; esta ejecución se omite.")
+        return None
+    hb = start_heartbeat()
+    try:
+        prog = load_prog(tag)
+        res = {"status": "local", "files": 0, "mails": 0, "errors": []}
+        collected = prog["collect_done"]
+        if not collected and collect_allowed:
+            if prog["mail"] or prog["files_done"]:
+                log(f"Retomando {tag}: {sum(1 for s in prog['mail'].values() if s.get('done'))} buzones ya completos")
+            try:
+                collect(cfg, y, m, prog, log, stop)
+                collected = True
+            except Stopped:
+                save_prog(tag, prog)
+                log("Detenido. Se retomará desde el último punto de control.")
+                res["status"] = "stopped"; return res
+        used = None
+        if collected and not (prog["collect_done"] and prog["send_done"]):
+            ok, used, why = send(cfg, tag, log)
+            if ok and prog["collect_done"]:
+                prog["send_done"] = True
+            elif not ok:
+                log("  Envío pendiente; se reintentará.")
+        if prog["collect_done"] and prog["send_done"]:
+            res["status"] = "ok"
+        elif prog["errors"]:
+            res["status"] = "error"
+        res.update(files=prog["files"], mails=prog["mails"], errors=list(prog["errors"]))
+        save_prog(tag, prog)
+        if (y, m) == prev_month():
+            cfg["last_status"], cfg["last_attempt"] = res["status"], date.today().isoformat()
+            if res["status"] == "ok":
+                cfg["last_done"] = tag
+            save_cfg(cfg)
+        if res["status"] in ("ok", "error"):
+            for d in ([used] if used else destinations(cfg)):
+                if dest_reachable(d)[0]:
+                    write_status(cfg, tag, res, d); break
+        if res["status"] == "ok" and cfg.get("delete_local_after_send"):
+            shutil.rmtree(local_dir(cfg, tag), ignore_errors=True)
+        log(f"== {tag}: {res['status'].upper()} (archivos={res['files']}, correos={res['mails']}, "
+            f"errores={len(res['errors'])})")
+        return res
+    finally:
+        hb.set()
+        LOCK_FILE.unlink(missing_ok=True)
+
+
+def my_minute_slot(name):
+    """Minuto (0-54) de la hora que le toca a esta máquina, para no saturar la red con 120 equipos a la vez."""
+    h = int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16)
+    return h % 55
+
+
+REQUEST_SUBDIR = "_solicitudes"
+
+
+def request_file(dest, machine_name):
+    return Path(dest) / REQUEST_SUBDIR / f"{machine_name.strip()}.json"
+
+
+def check_backup_request(cfg, log):
+    """Revisa si el panel del administrador pidió un respaldo inmediato para esta máquina.
+    Se llama muy seguido (cada pocos minutos) y en el caso normal solo hace una prueba de
+    existencia de archivo, así que es prácticamente gratis."""
+    for dest in destinations(cfg):
+        rf = request_file(dest, cfg["machine_name"])
+        if not rf.exists():
+            continue
+        try:
+            data = json.loads(rf.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        try:
+            rf.unlink()
+        except Exception:
+            pass
+        mes = data.get("mes", "")
+        if mes and len(mes) == 7 and mes[4] == "-":
+            y, m = int(mes[:4]), int(mes[5:])
+        else:
+            y, m = prev_month()
+        log(f"Solicitud recibida desde el panel del administrador: respaldar {y}-{m:02d} ahora.")
+        run_job(cfg, y, m, log, collect_allowed=True)
+        return True
+    return False
+
+
+def run_watch():
+    """Modo liviano para la tarea que revisa cada pocos minutos si el administrador pidió
+    un respaldo inmediato. No hace nada más (no cuenta días, no reparte horarios)."""
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+
+    def log(msg):
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+    cfg = load_cfg()
+    check_backup_request(cfg, log)
+
+
+def run_auto(mode):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    lower_priority()
+
+    def log(msg):
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+    cfg = load_cfg()
+    today = date.today()
+    y, m = prev_month(today)
+    tag = f"{y}-{m:02d}"
+    if mode == "catchup":
+        prog = load_prog(tag)
+        started = prog["files_done"] or prog["collect_done"] or bool(prog["mail"])
+        if not started:
+            slot = my_minute_slot(cfg["machine_name"])
+            if abs(datetime.now().minute - slot) > 2:
+                return                                            # aún no es su turno en esta hora
+        pend = [fp.stem for fp in PROG_DIR.glob("*.json")
+                if fp.stem != tag and load_prog(fp.stem)["collect_done"] and not load_prog(fp.stem)["send_done"]]
+        allow = today.day <= WINDOW_DAYS
+        needs = cfg["last_done"] != tag and (allow or (prog["collect_done"] and not prog["send_done"]))
+        if not needs and not pend:
+            return
+        if cfg["last_status"] == "error" and cfg["last_attempt"] == today.isoformat() and not pend:
+            return
+        for t in pend:
+            run_job(cfg, int(t[:4]), int(t[5:]), log, collect_allowed=False)
+        if needs:
+            run_job(cfg, y, m, log, collect_allowed=allow)
+    else:
+        run_job(cfg, y, m, log)
+
+
+def _principal_xml(cfg):
+    return ("<UserId>SYSTEM</UserId><RunLevel>HighestAvailable</RunLevel>" if cfg.get("run_as_system", True)
+            else "<RunLevel>HighestAvailable</RunLevel>")
+
+
+def _exe_cmd_args(extra_arg):
+    if getattr(sys, "frozen", False):
+        return sys.executable, extra_arg
+    py = sys.executable.replace("python.exe", "pythonw.exe")
+    return (py if os.path.exists(py) else sys.executable), f'"{os.path.abspath(__file__)}" {extra_arg}'
+
+
+def schedule_task(cfg):
+    """Registra dos tareas:
+    - La principal (TASK_NAME): hace el respaldo del mes, repartido en horario, del día 1 al 9.
+    - La de vigilancia (TASK_NAME + 'Watch'): cada 5 minutos, solo para reaccionar rápido si el
+      administrador pide un respaldo inmediato desde el panel. Revisar un archivo es casi gratis,
+      así que correr tan seguido no sobrecarga la laptop."""
+    cmd, args = _exe_cmd_args("--catchup")
+    principal = _principal_xml(cfg)
+    xml_main = f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+ <Triggers>
+  <CalendarTrigger>
+   <Repetition><Interval>PT1H</Interval><Duration>PT10H</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+   <StartBoundary>{datetime.now():%Y-%m-%d}T09:00:00</StartBoundary>
+   <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+  </CalendarTrigger>
+  <BootTrigger><Enabled>true</Enabled></BootTrigger>
+ </Triggers>
+ <Principals><Principal id="Author">{principal}</Principal></Principals>
+ <Settings>
+  <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+  <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+  <StartWhenAvailable>true</StartWhenAvailable>
+  <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  <Hidden>true</Hidden>
+ </Settings>
+ <Actions Context="Author"><Exec><Command>{cmd}</Command><Arguments>{args}</Arguments></Exec></Actions>
+</Task>'''
+    cmd_w, args_w = _exe_cmd_args("--vigilar")
+    xml_watch = f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+ <Triggers>
+  <TimeTrigger>
+   <Repetition><Interval>PT5M</Interval></Repetition>
+   <StartBoundary>{datetime.now():%Y-%m-%d}T00:00:00</StartBoundary>
+  </TimeTrigger>
+  <BootTrigger><Enabled>true</Enabled></BootTrigger>
+ </Triggers>
+ <Principals><Principal id="Author">{principal}</Principal></Principals>
+ <Settings>
+  <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+  <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+  <StartWhenAvailable>true</StartWhenAvailable>
+  <ExecutionTimeLimit>PT4M</ExecutionTimeLimit>
+  <Hidden>true</Hidden>
+ </Settings>
+ <Actions Context="Author"><Exec><Command>{cmd_w}</Command><Arguments>{args_w}</Arguments></Exec></Actions>
+</Task>'''
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    out = []
+    for name, xml in ((TASK_NAME, xml_main), (TASK_NAME + "Watch", xml_watch)):
+        fp = CFG_DIR / f"{name}.xml"
+        fp.write_text(xml, encoding="utf-16")
+        r = subprocess.run(["schtasks", "/create", "/f", "/tn", name, "/xml", str(fp)], capture_output=True, text=True)
+        out.append((r.returncode, (r.stdout + r.stderr).strip()))
+    code = 0 if all(c == 0 for c, _ in out) else 1
+    return code, " | ".join(o for _, o in out)
+
+
+# ------------------------------------------------------------------ instalación silenciosa (--instalar)
+def install_silent(argv):
+    """python respaldo_mensual.py --instalar --maquina "LAPC 46" --destino \\\\192.168.1.100\\Respaldos
+       [--destino-alt \\\\PC100\\Respaldos] [--usuario-objetivo "ULAPC 46"] [--sin-system]"""
+    cfg = load_cfg()
+    flags = {"--maquina": "machine_name", "--destino": "destination", "--destino-alt": "destination_alt",
+             "--local-root": "local_root", "--usuario-objetivo": "target_user",
+             "--usuario-red": "net_user", "--password-red": "net_pass"}
+    for i, a in enumerate(argv):
+        if a in flags and i + 1 < len(argv):
+            cfg[flags[a]] = argv[i + 1]
+    if "--sin-system" in argv:
+        cfg["run_as_system"] = False
+    save_cfg(cfg)
+    hide_path(Path(cfg["local_root"]))
+    hide_path(CFG_DIR)
+    # Guardar credenciales de red para la cuenta SYSTEM
+    for dest in destinations(cfg):
+        host = _host_from_dest(dest)
+        if host and cfg.get("net_user"):
+            ok, msg = save_net_credentials_for_system(host, cfg["net_user"], cfg["net_pass"])
+            print(f"credenciales {host}: {'OK' if ok else msg}")
+    code, out = schedule_task(cfg)
+    print(f"maquina={cfg['machine_name']} schtasks_code={code} {out}")
+    return 0 if code == 0 else 1
+
+
+# ------------------------------------------------------------------ GUI
+# Paleta de colores simple y amigable
+C_BG = "#F2F6FC"          # fondo general, azul muy claro
+C_CARD = "#FFFFFF"        # tarjetas blancas
+C_PRIMARY = "#2563EB"     # azul: acción principal
+C_PRIMARY_DK = "#1D4ED8"
+C_GREEN = "#16A34A"       # éxito
+C_GREEN_BG = "#DCFCE7"
+C_ORANGE = "#D97706"      # pendiente / aviso
+C_ORANGE_BG = "#FEF3C7"
+C_RED = "#DC2626"         # error
+C_RED_BG = "#FEE2E2"
+C_TEXT = "#1F2937"
+C_MUTED = "#6B7280"
+FONT = ("Segoe UI", 10)
+FONT_B = ("Segoe UI", 10, "bold")
+FONT_H = ("Segoe UI", 15, "bold")
+
+
+def run_gui():
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    cfg = load_cfg()
+    root = tk.Tk()
+    root.title("Respaldo Mensual")
+    root.geometry("1060x740")
+    root.configure(bg=C_BG)
+    root.minsize(980, 600)
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
     except Exception:
         pass
+    style.configure(".", background=C_BG, foreground=C_TEXT, font=FONT)
+    style.configure("TFrame", background=C_BG)
+    style.configure("Card.TFrame", background=C_CARD)
+    style.configure("TLabel", background=C_BG, foreground=C_TEXT, font=FONT)
+    style.configure("Card.TLabel", background=C_CARD, foreground=C_TEXT, font=FONT)
+    style.configure("Muted.TLabel", background=C_BG, foreground=C_MUTED, font=FONT)
+    style.configure("CardMuted.TLabel", background=C_CARD, foreground=C_MUTED, font=FONT)
+    style.configure("Header.TLabel", background=C_BG, foreground=C_PRIMARY_DK, font=FONT_H)
+    style.configure("CardTitle.TLabel", background=C_CARD, foreground=C_PRIMARY_DK, font=FONT_B)
+    style.configure("TLabelframe", background=C_CARD, bordercolor="#D7E2F2")
+    style.configure("TLabelframe.Label", background=C_CARD, foreground=C_PRIMARY_DK, font=FONT_B)
+    style.configure("TEntry", padding=5, fieldbackground="#FFFFFF")
+    style.configure("TSpinbox", padding=4, fieldbackground="#FFFFFF")
+    style.configure("TCheckbutton", background=C_CARD, font=FONT)
+    style.configure("TNotebook", background=C_BG, borderwidth=0)
+    style.configure("TNotebook.Tab", font=FONT_B, padding=[16, 8])
 
-    log.info(f"Iniciando respaldo automatico ({today})")
-    try:
-        run_backup(cfg)
-    except Exception as e:
-        log.error(f"Respaldo fallido: {e}. Se reintentara en el siguiente trigger.")
-    finally:
-        # Siempre eliminar el lock al terminar
-        lock_file.unlink(missing_ok=True)
+    style.configure("TButton", font=FONT, padding=6)
+    style.configure("Primary.TButton", font=FONT_B, padding=9, background=C_PRIMARY, foreground="white")
+    style.map("Primary.TButton", background=[("active", C_PRIMARY_DK)])
+    style.configure("Soft.TButton", font=FONT, padding=6, background="#E5EDFB", foreground=C_PRIMARY_DK)
+    style.map("Soft.TButton", background=[("active", "#D3E1F8")])
+    style.configure("Danger.TButton", font=FONT, padding=6, background=C_RED_BG, foreground=C_RED)
+    style.map("Danger.TButton", background=[("active", "#FACACA")])
+    style.configure("Link.TButton", font=("Segoe UI", 9), padding=2, background=C_BG, foreground=C_MUTED,
+                     borderwidth=0)
 
+    q = queue.Queue()
+    cancel = {"v": False}
 
-# ───────────────────────────────────────────────
-#  Interfaz grafica
-# ───────────────────────────────────────────────
+    # ---------- encabezado ----------
+    header = ttk.Frame(root); header.pack(fill="x", padx=16, pady=(14, 4))
+    ttk.Label(header, text="🗂️  Respaldo Mensual", style="Header.TLabel").pack(side="left")
+    lbl_badge = tk.Label(header, text="", font=FONT_B, padx=12, pady=4)
+    lbl_badge.pack(side="right")
 
-# Credenciales de acceso al programa
-# Para cambiar: modificar ADMIN_USER y ADMIN_PASS aqui
-ADMIN_USER = "admin"
-ADMIN_PASS = "Respaldo2024"
+    body = ttk.Frame(root); body.pack(fill="both", expand=True, padx=16, pady=6)
 
+    canvas = tk.Canvas(body, bg=C_BG, highlightthickness=0)
+    vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    f = ttk.Frame(canvas)
+    f.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=f, anchor="nw", width=760)
+    canvas.configure(yscrollcommand=vsb.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
 
-class LoginApp(tk.Tk):
-    """Ventana de login que debe pasar antes de abrir el programa."""
-    BG    = "#0d0d14"
-    PANEL = "#13131f"
-    CARD  = "#1a1a2e"
-    ACCENT= "#00d4aa"
-    FG    = "#e8eaf6"
-    FG2   = "#7986cb"
-    RED   = "#ff5252"
+    def _wheel(e):
+        canvas.yview_scroll(int(-e.delta / 120), "units")
+    canvas.bind_all("<MouseWheel>", _wheel)
 
-    def __init__(self):
-        super().__init__()
-        self.title("Acceso - Sistema de Respaldo Mensual")
-        self.geometry("400x320")
-        self.resizable(False, False)
-        self.configure(bg=self.BG)
-        self.resultado = False
-        self._build()
-        self.eval("tk::PlaceWindow . center")
-        # Centrar en pantalla
-        self.update_idletasks()
-        x = (self.winfo_screenwidth()  - 400) // 2
-        y = (self.winfo_screenheight() - 320) // 2
-        self.geometry(f"400x320+{x}+{y}")
+    V = {k: tk.StringVar(value=cfg.get(k, "")) for k in
+         ("machine_name", "destination", "destination_alt", "local_root", "thunderbird", "target_user",
+          "net_user", "net_pass")}
+    v_excl = tk.StringVar(value=", ".join(cfg.get("excluded_users", [])))
+    v_del = tk.BooleanVar(value=cfg["delete_local_after_send"])
+    v_sys = tk.BooleanVar(value=cfg.get("run_as_system", True))
+    py_, pm_ = prev_month()
+    v_year, v_month = tk.IntVar(value=py_), tk.IntVar(value=pm_)
 
-    def _build(self):
-        # Barra superior
-        tk.Frame(self, bg=self.ACCENT, height=3).pack(fill="x")
-        tk.Label(self, text="SISTEMA DE RESPALDO MENSUAL",
-                 bg=self.BG, fg=self.ACCENT,
-                 font=("Courier New", 11, "bold")).pack(pady=(20, 4))
-        tk.Label(self, text=f"PC:  {get_pc_label()}",
-                 bg=self.BG, fg=self.FG2,
-                 font=("Courier New", 9)).pack()
+    def card(parent, title):
+        lf = ttk.Labelframe(parent, text=title, padding=14)
+        lf.pack(fill="x", pady=8, padx=2)
+        lf.columnconfigure(1, weight=1)
+        return lf
 
-        # Formulario
-        form = tk.Frame(self, bg=self.CARD)
-        form.pack(fill="x", padx=30, pady=20)
+    def field(parent, r, label, key, browse=False, help_=None):
+        ttk.Label(parent, text=label, style="Card.TLabel").grid(row=r, column=0, sticky="w", pady=4, padx=(0, 8))
+        ttk.Entry(parent, textvariable=V[key]).grid(row=r, column=1, sticky="ew", pady=4)
+        if browse:
+            ttk.Button(parent, text="📁 Elegir…", style="Soft.TButton",
+                       command=lambda: V[key].set(filedialog.askdirectory() or V[key].get())
+                       ).grid(row=r, column=2, padx=6)
+        if help_:
+            ttk.Label(parent, text=help_, style="CardMuted.TLabel").grid(
+                row=r + 1, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
-        for row, (label, attr, show) in enumerate([
-            ("Usuario:", "_entry_user", ""),
-            ("Contraseña:", "_entry_pass", "*"),
-        ]):
-            tk.Label(form, text=label, bg=self.CARD, fg=self.FG,
-                     font=("Segoe UI", 10), width=12, anchor="e").grid(
-                row=row, column=0, padx=(12, 8), pady=10, sticky="e")
-            e = tk.Entry(form, bg="#0d0d14", fg=self.FG,
-                         insertbackground=self.ACCENT,
-                         relief="flat", font=("Courier New", 11),
-                         show=show, width=22)
-            e.grid(row=row, column=1, padx=(0, 12), ipady=6)
-            setattr(self, attr, e)
+    # ---- tarjeta: esta máquina ----
+    c1 = card(f, "💻  Esta máquina")
+    field(c1, 0, "Nombre con el que se guarda en PC100:", "machine_name",
+          help_="Ej. «LAPC 46». Así se llamará la carpeta de esta máquina en el servidor.")
+    lbl_users = ttk.Label(c1, text="", style="CardMuted.TLabel")
+    lbl_users.grid(row=2, column=0, columnspan=3, sticky="w")
+    lbl_tb = ttk.Label(c1, text="", style="CardMuted.TLabel", wraplength=680, justify="left")
+    lbl_tb.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-        self._entry_user.insert(0, "admin")
-        self._entry_pass.bind("<Return>", lambda e: self._login())
-        self._entry_pass.focus_set()
+    # ---- tarjeta: a dónde enviar + credenciales ----
+    c2 = card(f, "🌐  A dónde se envía (PC100)")
+    c2.columnconfigure(1, weight=1)
 
-        # Mensaje de error
-        self.lbl_error = tk.Label(self, text="", bg=self.BG,
-                                   fg=self.RED, font=("Segoe UI", 9))
-        self.lbl_error.pack()
+    field(c2, 0, "Destino principal (recomendado: IP de PC100):", "destination", True)
+    field(c2, 1, "Destino de respaldo (nombre de PC100):", "destination_alt")
 
-        # Boton
-        tk.Button(self, text="ENTRAR",
-                  bg=self.ACCENT, fg=self.BG,
-                  activebackground="#00b894",
-                  relief="flat", cursor="hand2",
-                  font=("Courier New", 11, "bold"),
-                  padx=30, pady=8,
-                  command=self._login).pack(pady=(0, 20))
+    # Separador visual
+    ttk.Separator(c2, orient="horizontal").grid(row=3, column=0, columnspan=3, sticky="ew", pady=10)
+    ttk.Label(c2, text="🔑  Credenciales de la carpeta compartida", style="CardTitle.TLabel"
+              ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 6))
+    ttk.Label(c2, text="Usuario (ej. PC100\\respaldo o solo respaldo):", style="Card.TLabel"
+              ).grid(row=5, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Entry(c2, textvariable=V["net_user"]).grid(row=5, column=1, sticky="ew", pady=4)
+    ttk.Label(c2, text="Contraseña:", style="Card.TLabel"
+              ).grid(row=6, column=0, sticky="w", pady=4, padx=(0, 8))
+    e_pass = ttk.Entry(c2, textvariable=V["net_pass"], show="●")
+    e_pass.grid(row=6, column=1, sticky="ew", pady=4)
+    v_show = tk.BooleanVar(value=False)
+    def toggle_pass():
+        e_pass.config(show="" if v_show.get() else "●")
+    ttk.Checkbutton(c2, text="Mostrar", variable=v_show, command=toggle_pass,
+                    style="TCheckbutton").grid(row=6, column=2, padx=6)
+    ttk.Label(c2,
+              text="Si la carpeta de PC100 requiere usuario y contraseña, ponlos aquí.\n"
+                   "El botón 'Guardar credenciales en SYSTEM' los registra para que la\n"
+                   "tarea programada (que corre en segundo plano) también tenga acceso.",
+              style="CardMuted.TLabel", justify="left"
+              ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-    def _login(self):
-        user = self._entry_user.get().strip()
-        pwd  = self._entry_pass.get()
-        if user == ADMIN_USER and pwd == ADMIN_PASS:
-            self.resultado = True
-            self.destroy()
-        else:
-            self.lbl_error.configure(text="Usuario o contraseña incorrectos")
-            self._entry_pass.delete(0, "end")
-            self._entry_pass.focus_set()
-            # Sacudir la ventana para indicar error
-            x, y = self.winfo_x(), self.winfo_y()
-            for dx in [8, -8, 6, -6, 4, -4, 0]:
-                self.geometry(f"+{x+dx}+{y}")
-                self.update()
-                self.after(30)
+    lbl_cred_status = ttk.Label(c2, text="", style="CardMuted.TLabel")
+    lbl_cred_status.grid(row=8, column=0, columnspan=3, sticky="w")
 
-
-class RespaldoApp(tk.Tk):
-    BG=     "#0d0d14"; PANEL=  "#13131f"; CARD=   "#1a1a2e"
-    BORDER= "#2a2a45"; ACCENT= "#00d4aa"; ACC2=   "#0099ff"
-    FG=     "#e8eaf6"; FG2=    "#7986cb"; GREEN=  "#00e676"
-    RED=    "#ff5252"; YELLOW= "#ffd740"
-
-    def __init__(self):
-        super().__init__()
-        self.title(f"Respaldo Mensual  -  {get_pc_label()}")
-        self.geometry("900x820")
-        self.minsize(820, 720)
-        self.configure(bg=self.BG)
-        self.cfg = load_config()
-        self._build_ui()
-        self.eval("tk::PlaceWindow . center")
-        if self.cfg.get("retry_pending"):
-            self.after(1000, lambda: self._log(
-                "Hay un respaldo pendiente de reintento.", self.YELLOW))
-
-    def _build_ui(self):
-        hdr = tk.Frame(self, bg=self.PANEL); hdr.pack(fill="x")
-        tk.Frame(hdr, bg=self.ACCENT, height=3).pack(fill="x")
-        row = tk.Frame(hdr, bg=self.PANEL); row.pack(fill="x", padx=30, pady=16)
-        tk.Label(row, text="SISTEMA DE RESPALDO MENSUAL",
-                 bg=self.PANEL, fg=self.ACCENT,
-                 font=("Courier New", 15, "bold")).pack(side="left")
-        tk.Label(row, text=get_pc_label(), bg=self.ACCENT, fg=self.BG,
-                 font=("Courier New", 12, "bold"), padx=12, pady=4).pack(side="right")
-
-        st = ttk.Style(self); st.theme_use("clam")
-        st.configure("TNotebook",        background=self.BG,   borderwidth=0)
-        st.configure("TNotebook.Tab",    background=self.CARD, foreground=self.FG2,
-                     font=("Courier New", 10), padding=[18, 8])
-        st.map("TNotebook.Tab",
-               background=[("selected", self.PANEL)],
-               foreground=[("selected", self.ACCENT)])
-        st.configure("TCheckbutton",     background=self.CARD, foreground=self.FG,
-                     font=("Segoe UI", 10))
-        st.configure("Accent.Horizontal.TProgressbar", troughcolor=self.BORDER,
-                     background=self.ACCENT, thickness=14)
-
-        nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
-        t1=tk.Frame(nb,bg=self.BG); t2=tk.Frame(nb,bg=self.BG); t3=tk.Frame(nb,bg=self.BG)
-        nb.add(t1, text="  Respaldo  ")
-        nb.add(t2, text="  Configuracion  ")
-        nb.add(t3, text="  Historial  ")
-        self._tab_respaldo(t1); self._tab_config(t2); self._tab_historial(t3)
-
-    def _tab_respaldo(self, p):
-        today     = date.today()
-        # El respaldo corre el 1er dia habil del mes siguiente
-        # y respalda el mes ACTUAL completo (no el anterior)
-        # Ejemplo: si hoy es marzo, el respaldo del 1 de abril respalda TODO marzo
-        # Proximo automatico: 1er dia habil del mes siguiente
-        next_run  = first_business_day_of_month(
-            (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-        )
-        days_left = (next_run - today).days
-        # El mes a respaldar es el mes ANTERIOR (igual que run_backup)
-        start_d, end_d = month_range(today)
-        share     = self.cfg.get("share_root", "sin configurar")
-        net_prev  = str(Path(share) / get_pc_label() / start_d.strftime("%Y-%m"))
-
-        card = tk.Frame(p, bg=self.CARD); card.pack(fill="x", padx=24, pady=(20, 8))
-        tk.Frame(card, bg=self.ACC2, width=4).pack(side="left", fill="y")
-        inner = tk.Frame(card, bg=self.CARD); inner.pack(side="left", padx=16, pady=14)
-
-        dc = self.GREEN if days_left > 5 else (self.YELLOW if days_left > 1 else self.RED)
-        rows = [
-            (f"PC detectada:         {get_pc_label()}",                                          self.FG),
-            (f"Mes a respaldar:      {start_d.strftime('%B %Y')}  ({start_d} al {end_d})", self.FG),
-            (f"Destino en red:       {net_prev}",                                   self.ACCENT),
-            (f"Ultimo respaldo:      {self.cfg.get('last_backup', 'Nunca')}",                    self.FG2),
-            (f"Proximo automatico:   {next_run}  ({days_left} dias restantes)",                  dc),
-        ]
-        labels = []
-        for text, color in rows:
-            lbl = tk.Label(inner, text=text, bg=self.CARD, fg=color,
-                           font=("Courier New", 11))
-            lbl.pack(anchor="w", pady=1)
-            labels.append(lbl)
-        self.lbl_remote = labels[2]
-
-        fc = tk.Frame(p, bg=self.CARD); fc.pack(fill="x", padx=24, pady=8)
-        tk.Label(fc, text="QUE SE RESPALDA", bg=self.CARD, fg=self.FG2,
-                 font=("Courier New", 9, "bold")).pack(anchor="w", padx=16, pady=(10, 4))
-        self.folder_vars = {}
-        grid = tk.Frame(fc, bg=self.CARD); grid.pack(fill="x", padx=16, pady=(0, 4))
-        for idx, (name, path) in enumerate(get_default_folders().items()):
-            var = tk.BooleanVar(value=True); self.folder_vars[name] = var
-            ttk.Checkbutton(grid, text=f"  {name}   ({path})", variable=var).grid(
-                row=idx//2, column=idx%2, sticky="w", padx=12, pady=2)
-
-        self._tb_var = tk.BooleanVar(value=self.cfg.get("backup_thunderbird", True))
-        profile = find_thunderbird_profile()
-        tb_txt = "  Correos Thunderbird  " + ("(detectado)" if profile else "(no encontrado)")
-        ttk.Checkbutton(grid, text=tb_txt, variable=self._tb_var).grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 10))
-
-        btn_row = tk.Frame(p, bg=self.BG)
-        btn_row.pack(pady=14)
-        self.btn_run = tk.Button(btn_row, text="EJECUTAR RESPALDO AHORA",
-                                 bg=self.ACCENT, fg=self.BG, activebackground=self.GREEN,
-                                 relief="flat", cursor="hand2",
-                                 font=("Courier New", 12, "bold"), padx=28, pady=12,
-                                 command=self._start_backup)
-        self.btn_run.pack(side="left", padx=(0,8))
-        self.btn_force = tk.Button(btn_row, text="Forzar respaldo",
-                                   bg=self.YELLOW, fg=self.BG, activebackground="#ffab00",
-                                   relief="flat", cursor="hand2",
-                                   font=("Courier New", 10, "bold"), padx=16, pady=12,
-                                   command=self._start_backup_forced)
-        self.btn_force.pack(side="left")
-
-        self.progress = ttk.Progressbar(p, style="Accent.Horizontal.TProgressbar",
-                                        mode="determinate", length=700)
-        self.progress.pack(padx=24)
-        self.lbl_prog = tk.Label(p, text="", bg=self.BG, fg=self.FG2,
-                                 font=("Courier New", 9)); self.lbl_prog.pack()
-
-        lf = tk.Frame(p, bg=self.BG)
-        lf.pack(fill="both", expand=True, padx=24, pady=(6, 20))
-        self.live_log = tk.Text(lf, bg=self.PANEL, fg=self.FG2,
-                                font=("Courier New", 9), relief="flat",
-                                state="disabled", wrap="word", height=10)
-        sc = tk.Scrollbar(lf, command=self.live_log.yview)
-        self.live_log.configure(yscrollcommand=sc.set)
-        self.live_log.pack(side="left", fill="both", expand=True); sc.pack(side="right", fill="y")
-
-    def _tab_config(self, p):
-        form = tk.Frame(p, bg=self.CARD); form.pack(fill="x", padx=24, pady=24)
-
-        tk.Label(form, text="RUTA DE RED  (ULAPC 46)",
-                 bg=self.CARD, fg=self.FG2,
-                 font=("Courier New", 10, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(14, 10))
-
-        tk.Label(form, text="Carpeta compartida:", bg=self.CARD, fg=self.FG,
-                 font=("Segoe UI", 10), width=22, anchor="e").grid(
-            row=1, column=0, sticky="e", padx=(18, 8), pady=8)
-
-        self._share_var = tk.StringVar(
-            value=self.cfg.get("share_root", "\\\\ULAPC46\\Respaldos"))
-        tk.Entry(form, textvariable=self._share_var,
-                 bg=self.BG, fg=self.FG, insertbackground=self.ACCENT,
-                 relief="flat", font=("Courier New", 10), width=42).grid(
-            row=1, column=1, sticky="w", padx=(0, 8), ipady=5)
-        tk.Button(form, text="Examinar", bg=self.BORDER, fg=self.FG,
-                  relief="flat", font=("Segoe UI", 9), padx=8, pady=4,
-                  cursor="hand2", command=self._browse_share).grid(
-            row=1, column=2, padx=(0, 18))
-
-        tk.Label(form,
-                 text="Ejemplo:  \\\\ULAPC46\\Respaldos\nSe creara:  LAPC XX / 2026-02",
-                 bg=self.CARD, fg=self.FG2,
-                 font=("Courier New", 8), justify="left").grid(
-            row=2, column=1, columnspan=2, sticky="w", padx=(0, 18), pady=(0, 10))
-
-        tk.Frame(form, bg=self.BORDER, height=1).grid(
-            row=3, column=0, columnspan=3, sticky="ew", padx=18, pady=(4, 12))
-
-        tk.Label(form, text="CORREOS THUNDERBIRD",
-                 bg=self.CARD, fg=self.FG2,
-                 font=("Courier New", 10, "bold")).grid(
-            row=4, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6))
-
-        self._cfg_tb = tk.BooleanVar(value=self.cfg.get("backup_thunderbird", True))
-        ttk.Checkbutton(form,
-            text="  Respaldar correos (Bandeja + Enviados) como .eml filtrados por fecha",
-            variable=self._cfg_tb).grid(row=5, column=1, columnspan=2, sticky="w", pady=3)
-
-        self._cfg_tb_prof = tk.BooleanVar(value=self.cfg.get("tb_profile_copy", True))
-        ttk.Checkbutton(form,
-            text="  Incluir copia completa del perfil de Thunderbird (restaurable)",
-            variable=self._cfg_tb_prof).grid(row=6, column=1, columnspan=2, sticky="w", pady=3)
-
-        profile = find_thunderbird_profile()
-        tk.Label(form,
-            text="  Perfil detectado: " + (str(profile) if profile else "No detectado en esta PC"),
-            bg=self.CARD, fg=self.FG2 if profile else self.YELLOW,
-            font=("Courier New", 8)).grid(
-            row=7, column=1, columnspan=2, sticky="w", pady=(0, 10))
-
-        tk.Frame(form, bg=self.BORDER, height=1).grid(
-            row=8, column=0, columnspan=3, sticky="ew", padx=18, pady=(4, 12))
-
-        brow = tk.Frame(form, bg=self.CARD)
-        brow.grid(row=9, column=0, columnspan=3, pady=(4, 18))
-        for text, cmd, primary in [
-            ("Guardar",                   self._save_config,      True),
-            ("Probar conexion de red",    self._test_net,         False),
-            ("Instalar tarea automatica", self._install_task,     False),
-            ("Probar en 2 minutos",       self._install_task_test,False),
-        ]:
-            tk.Button(brow, text=text,
-                      bg=self.ACCENT if primary else self.BORDER,
-                      fg=self.BG if primary else self.FG,
-                      activebackground=self.GREEN if primary else self.CARD,
-                      relief="flat", cursor="hand2",
-                      font=("Courier New", 10, "bold" if primary else "normal"),
-                      padx=18, pady=8, command=cmd).pack(side="left", padx=6)
-
-        self.lbl_cfg_status = tk.Label(form, text="", bg=self.CARD, font=("Courier New", 9))
-        self.lbl_cfg_status.grid(row=10, column=0, columnspan=3)
-
-    def _tab_historial(self, p):
-        top = tk.Frame(p, bg=self.BG); top.pack(fill="x", padx=24, pady=(16, 6))
-        tk.Label(top, text="Log:  " + str(LOG_FILE),
-                 bg=self.BG, fg=self.FG2, font=("Courier New", 9)).pack(side="left")
-
-        self.lbl_autorefrsh = tk.Label(top, text="actualizando cada 5s",
-                 bg=self.BG, fg=self.BORDER, font=("Courier New", 8))
-        self.lbl_autorefrsh.pack(side="right", padx=(0, 8))
-
-        tk.Button(top, text="Actualizar ahora", bg=self.BORDER, fg=self.FG,
-                  relief="flat", font=("Courier New", 9), padx=8, pady=4,
-                  cursor="hand2", command=self._refresh_log_tab).pack(side="right")
-
-        frame = tk.Frame(p, bg=self.BG)
-        frame.pack(fill="both", expand=True, padx=24, pady=(0, 20))
-        self.hist_text = tk.Text(frame, bg=self.PANEL, fg=self.FG2,
-                                 font=("Courier New", 9), relief="flat",
-                                 state="disabled", wrap="word")
-        sc = tk.Scrollbar(frame, command=self.hist_text.yview)
-        self.hist_text.configure(yscrollcommand=sc.set)
-        self.hist_text.pack(side="left", fill="both", expand=True)
-        sc.pack(side="right", fill="y")
-        self._refresh_log_tab()
-        self._auto_refresh_log()  # iniciar auto-refresco
-
-    def _refresh_log_tab(self):
-        if not hasattr(self, "hist_text"):
+    def do_guardar_cred():
+        c = current_cfg()
+        save_cfg(c)
+        u = c.get("net_user", "").strip()
+        p = c.get("net_pass", "").strip()
+        if not u:
+            lbl_cred_status.config(text="⚠ Escribe el usuario antes de guardar.", foreground=C_ORANGE)
             return
-        # Guardar posicion del scroll para no saltar si el usuario esta leyendo
-        try:
-            at_end = self.hist_text.yview()[1] >= 0.95
-        except Exception:
-            at_end = True
+        lbl_cred_status.config(text="Guardando credenciales en SYSTEM…", foreground=C_MUTED)
+        def work():
+            msgs = []
+            for dest in destinations(c):
+                host = _host_from_dest(dest)
+                if host:
+                    # 1. Guardar en el almacén de SYSTEM (para la tarea programada)
+                    ok, msg = save_net_credentials_for_system(host, u, p, log)
+                    msgs.append(f"{host}: {'✔ guardado en SYSTEM' if ok else '⚠ ' + msg}")
+                    # 2. Guardar también para el usuario actual (para cuando se usa la GUI)
+                    subprocess.run(["cmdkey", f"/add:{host}", f"/user:{u}", f"/pass:{p}"],
+                                   capture_output=True)
+                    # 3. Verificar que la conexión funciona ahora
+                    mount_net_path(dest, u, p, log)
+                    ok2, why = dest_reachable(dest)
+                    msgs.append(f"  → Prueba de conexión: {'✔ OK' if ok2 else '✗ ' + why}")
+            resumen = " | ".join(msgs)
+            root.after(0, lambda: lbl_cred_status.config(
+                text=resumen[:160],
+                foreground=C_GREEN if all("✔" in m for m in msgs if "→" in m) else C_RED))
+        threading.Thread(target=work, daemon=True).start()
 
-        self.hist_text.configure(state="normal")
-        self.hist_text.delete("1.0", "end")
+    ttk.Button(c2, text="🔑 Guardar credenciales en SYSTEM", style="Soft.TButton",
+               command=do_guardar_cred).grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        if LOG_FILE.exists():
-            try:
-                content = LOG_FILE.read_text(encoding="utf-8", errors="replace")
-                lines = content.splitlines()
-                if lines:
-                    self.hist_text.insert("end", "\n".join(lines[-400:]))
-                    # Colorear lineas de error en rojo
-                    for tag, color in [("ERROR", self.RED), ("WARNING", self.YELLOW),
-                                       ("Listo", self.GREEN), ("completado", self.GREEN)]:
-                        idx = "1.0"
-                        while True:
-                            idx = self.hist_text.search(tag, idx, stopindex="end",
-                                                         nocase=True)
-                            if not idx:
-                                break
-                            line_end = f"{idx.split('.')[0]}.end"
-                            t = f"color_{tag}"
-                            self.hist_text.tag_config(t, foreground=color)
-                            self.hist_text.tag_add(t, idx, line_end)
-                            idx = line_end
-                else:
-                    self.hist_text.insert("end", "(el log esta vacio)")
-            except Exception as e:
-                self.hist_text.insert("end", f"Error leyendo log: {e}")
+    # ---- tarjeta: mes ----
+    c3 = card(f, "📅  Mes a respaldar")
+    mf = ttk.Frame(c3, style="Card.TFrame"); mf.grid(row=0, column=0, columnspan=3, sticky="w")
+    ttk.Spinbox(mf, from_=2000, to=2100, width=6, textvariable=v_year).pack(side="left")
+    ttk.Spinbox(mf, from_=1, to=12, width=4, textvariable=v_month).pack(side="left", padx=6)
+    ttk.Label(mf, text="(por defecto, el mes anterior)", style="CardMuted.TLabel").pack(side="left", padx=6)
+
+    # ---- tarjeta: carpetas extra ----
+    c4 = card(f, "➕  Carpetas extra (ej. escáner compartido)")
+    lb = tk.Listbox(c4, height=4, font=FONT, relief="flat", bg="#F8FAFD", highlightthickness=1,
+                     highlightbackground="#D7E2F2")
+    lb.grid(row=0, column=0, columnspan=2, sticky="ew")
+    for s in cfg["sources"]:
+        lb.insert("end", s)
+    bf = ttk.Frame(c4, style="Card.TFrame"); bf.grid(row=0, column=2, sticky="n", padx=6)
+    ttk.Button(bf, text="Agregar", style="Soft.TButton",
+               command=lambda: (lambda d: d and lb.insert("end", d))(filedialog.askdirectory())).pack(fill="x", pady=2)
+    ttk.Button(bf, text="Quitar", style="Soft.TButton",
+               command=lambda: [lb.delete(i) for i in reversed(lb.curselection())]).pack(fill="x", pady=2)
+
+    # ---- tarjeta: opciones avanzadas (plegable) ----
+    adv_shown = tk.BooleanVar(value=False)
+    adv_holder = ttk.Frame(f)
+
+    def toggle_adv():
+        if adv_shown.get():
+            adv_holder.pack_forget(); adv_shown.set(False); btn_adv.config(text="⚙️  Mostrar opciones avanzadas ▾")
         else:
-            self.hist_text.insert("end",
-                f"El log todavia no existe.\n\n"
-                f"Se creara cuando corra el primer respaldo.\n\n"
-                f"Ruta esperada: {LOG_FILE}")
+            adv_holder.pack(fill="x", pady=2, before=c6); adv_shown.set(True)
+            btn_adv.config(text="⚙️  Ocultar opciones avanzadas ▴")
 
-        if at_end:
-            self.hist_text.see("end")
-        self.hist_text.configure(state="disabled")
+    btn_adv = ttk.Button(f, text="⚙️  Mostrar opciones avanzadas ▾", style="Soft.TButton", command=toggle_adv)
+    btn_adv.pack(fill="x", pady=(10, 2))
 
-    def _auto_refresh_log(self):
-        """Refresca el log automaticamente cada 5 segundos."""
-        try:
-            self._refresh_log_tab()
-        except Exception:
-            pass
-        self.after(5000, self._auto_refresh_log)
+    c5 = ttk.Labelframe(adv_holder, text="⚙️  Opciones avanzadas", padding=14)
+    c5.pack(fill="x", pady=8); c5.columnconfigure(1, weight=1)
+    field(c5, 0, "Usuario objetivo (vacío = detectar solo):", "target_user",
+          help_="Déjalo vacío salvo que haya más de un usuario y debas precisar cuál, ej. «ULAPC».")
+    ttk.Label(c5, text="Usuarios excluidos (coma):", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=4)
+    ttk.Entry(c5, textvariable=v_excl).grid(row=2, column=1, sticky="ew", pady=4)
+    field(c5, 3, "Carpeta local temporal (oculta):", "local_root", True)
+    field(c5, 5, "Perfil de Thunderbird manual (opcional):", "thunderbird", True)
 
-    def _log(self, msg, color=None):
-        self.live_log.configure(state="normal")
-        tag = f"t{id(msg)}"
-        self.live_log.insert("end", msg + "\n", tag)
-        if color: self.live_log.tag_config(tag, foreground=color)
-        self.live_log.see("end"); self.live_log.configure(state="disabled")
-
-    def _browse_share(self):
-        folder = filedialog.askdirectory(title="Carpeta compartida de ULAPC46")
-        if folder: self._share_var.set(folder)
-
-    def _save_config(self):
-        raw = self._share_var.get().strip()
-        # Normalizar barras: el usuario puede escribir \ULAPC46\Res o \\ULAPC46\Res
-        # Python Path necesita que sea una ruta UNC valida
-        if raw.startswith("\\\\"):
-            raw = raw  # ya tiene 4 barras, ok
-        elif raw.startswith("\\\\") or raw.startswith("//"):
-            raw = raw
-        # Asegurar que empiece con doble barra para UNC
-        if raw.startswith("\\") and not raw.startswith("\\\\"):
-            pass  # correcto: \ULAPC46\Res
-        self.cfg["share_root"]         = raw
-        self.cfg["backup_thunderbird"] = self._cfg_tb.get()
-        self.cfg["tb_profile_copy"]    = self._cfg_tb_prof.get()
-        save_config(self.cfg)
-        start_d, _ = month_range()
-        net_prev = str(Path(self.cfg["share_root"]) / get_pc_label() / start_d.strftime("%Y-%m"))
-        self.lbl_remote.configure(text="Destino en red:       " + net_prev)
-        self.lbl_cfg_status.configure(text="Configuracion guardada", fg=self.GREEN)
-        self.after(3000, lambda: self.lbl_cfg_status.configure(text=""))
-
-    def _test_net(self):
-        self._save_config()
-        share = self.cfg.get("share_root", "")
-        self.lbl_cfg_status.configure(text="Probando conexion...", fg=self.YELLOW)
-        self.update()
-        try:
-            p = Path(share)
-            if p.exists() and p.is_dir():
-                self.lbl_cfg_status.configure(text="Conexion OK  -  " + share, fg=self.GREEN)
+    def do_buscar_tb():
+        """Busca perfiles de Thunderbird en los discos y los muestra en el log para copiar la ruta."""
+        log("🔍 Buscando perfiles de Thunderbird en el disco…")
+        def buscar():
+            encontrados = []
+            drives = [f"{chr(d)}:\\" for d in range(ord('C'), ord('F') + 1)
+                      if os.path.exists(f"{chr(d)}:\\")]
+            skip = {'windows', 'program files', 'program files (x86)',
+                    '$recycle.bin', 'programdata', 'system volume information'}
+            for drive in drives:
+                for rdir, dirs, files in os.walk(drive):
+                    dirs[:] = [d for d in dirs if d.lower() not in skip]
+                    if 'prefs.js' in files and 'thunderbird' in rdir.lower():
+                        encontrados.append(rdir)
+                        log(f"  ✔ Encontrado: {rdir}")
+                    if len(encontrados) >= 20:
+                        break
+            if not encontrados:
+                log("  No se encontró ningún perfil. ¿Thunderbird está instalado en esta PC?")
             else:
-                self.lbl_cfg_status.configure(text="No accesible:  " + share, fg=self.RED)
-        except Exception as e:
-            self.lbl_cfg_status.configure(text="Error: " + str(e), fg=self.RED)
+                log(f"  → Copia la ruta correcta en el campo 'Perfil de Thunderbird manual' de arriba.")
+        threading.Thread(target=buscar, daemon=True).start()
 
-    def _schtasks_create(self, task_name: str, xml_path: Path) -> bool:
-        """
-        Registra una tarea usando ShellExecute runas — UAC nativo de Windows.
-        El programa no necesita correr como admin; Windows pide permiso solo.
-        """
-        import ctypes, tempfile, time
+    ttk.Button(c5, text="🔍 Buscar Thunderbird en el disco", style="Soft.TButton",
+               command=do_buscar_tb).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    ttk.Checkbutton(c5, text="Borrar la copia local cuando se envíe correctamente", variable=v_del
+                    ).grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
+    ttk.Checkbutton(c5, text="Ejecutar la tarea programada en segundo plano (oculta, recomendado)", variable=v_sys
+                    ).grid(row=8, column=0, columnspan=2, sticky="w", pady=4)
 
-        bat = Path(tempfile.gettempdir()) / "instalar_tarea_respaldo.bat"
-        bat.write_text(
-            "@echo off\n"
-            "schtasks /Create /TN \"" + task_name + "\" /XML \"" + str(xml_path) + "\" /F\n"
-            "del /f /q \"" + str(xml_path) + "\"\n"
-            "del /f /q \"" + str(bat) + "\"\n",
-            encoding="utf-8"
-        )
+    # ---- registro de actividad ----
+    c6 = card(f, "📋  Actividad")
+    bar = ttk.Progressbar(c6, mode="indeterminate"); bar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+    logbox = tk.Text(c6, height=10, font=("Consolas", 9), bg="#F8FAFD", fg=C_TEXT, relief="flat",
+                      highlightthickness=1, highlightbackground="#D7E2F2")
+    logbox.grid(row=1, column=0, columnspan=3, sticky="ew")
 
+    def log(msg):
+        q.put(msg)
+        CFG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+    def pump():
         try:
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", str(bat), None, None, 1
-            )
-            if ret <= 32:
-                messagebox.showerror("Error",
-                    "No se pudo pedir permisos de administrador.\n"
-                    "Intenta abrir el programa con clic derecho -> Ejecutar como administrador.")
-                return False
-            # Esperar hasta 20s a que el bat termine (se borra solo)
-            for _ in range(20):
-                time.sleep(1)
-                if not bat.exists():
-                    return True
-            return True  # asumir OK si no se borro (puede pasar en algunas versiones)
-        except Exception as e:
-            messagebox.showerror("Error al registrar tarea", str(e))
-            return False
-        finally:
-            bat.unlink(missing_ok=True)
-
-    def _install_task_test(self):
-        """Instala tarea que corre en los proximos 2 minutos, para probar."""
-        from datetime import datetime, timedelta
-        script    = Path(sys.argv[0]).resolve()
-        python    = sys.executable
-        task_name = "RespaldoMensualPRUEBA"
-        # 2 minutos desde ahora
-        run_at    = datetime.now() + timedelta(minutes=2)
-        run_str   = run_at.strftime("%Y-%m-%dT%H:%M:%S")
-        xml = (
-            '<?xml version="1.0" encoding="UTF-16"?>\n'
-            '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
-            '  <RegistrationInfo><Description>PRUEBA respaldo - ' + get_pc_label() + '</Description></RegistrationInfo>\n'
-            '  <Triggers><TimeTrigger>\n'
-            '    <StartBoundary>' + run_str + '</StartBoundary>\n'
-            '    <Enabled>true</Enabled>\n'
-            '    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>\n'
-            '  </TimeTrigger></Triggers>\n'
-            '  <Settings>\n'
-            '    <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>\n'
-            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
-            '    <ExecutionTimeLimit>PT4H</ExecutionTimeLimit>\n'
-            '    <DeleteExpiredTaskAfter>PT1H</DeleteExpiredTaskAfter>\n'
-            '    <Enabled>true</Enabled>\n'
-            '  </Settings>\n'
-            '  <Actions><Exec>\n'
-            '    <Command>' + str(python) + '</Command>\n'
-            '    <Arguments>"' + str(script) + '" --auto</Arguments>\n'
-            '  </Exec></Actions>\n'
-            '</Task>'
-        )
-        xml_path = Path.home() / "respaldo_task_test.xml"
-        xml_path.write_text(xml, encoding="utf-16")
-        ret = os.system('schtasks /Create /TN "' + task_name + '" /XML "' + str(xml_path) + '" /F')
-        xml_path.unlink(missing_ok=True)
-        if ret == 0:
-            messagebox.showinfo("Tarea de prueba instalada",
-                f"El respaldo automatico correra en 2 minutos.\n\n"
-                f"Hora programada: {run_at.strftime('%H:%M')}\n"
-                f"Revisa el log en la pestana Historial para ver el resultado.\n\n"
-                f"La tarea se elimina sola despues de ejecutarse.")
-        else:
-            messagebox.showerror("Error",
-                "No se pudo crear la tarea de prueba.\nEjecuta como Administrador.")
-
-    def _run_task_script(self, args: str, success_msg: str):
-        """Llama a instalar_tarea.py como administrador via ShellExecute runas."""
-        import ctypes, time
-        # El script esta junto al programa
-        script_dir = Path(sys.argv[0]).resolve().parent
-        task_script = script_dir / "instalar_tarea.py"
-        if not task_script.exists():
-            messagebox.showerror("Error",
-                f"No se encontro instalar_tarea.py en\n{script_dir}\n\n"
-                "Asegurate de que este en la misma carpeta que respaldo_mensual.py")
-            return
-        python = sys.executable
-        cmd_args = f'"{python}" "{task_script}" {args}'
-        ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "cmd.exe", f"/c {cmd_args} & pause", None, 1
-        )
-        if ret <= 32:
-            messagebox.showerror("Error",
-                "No se pudo pedir permisos de administrador.\n"
-                "Intenta abrir el programa con clic derecho -> Ejecutar como administrador.")
-        else:
-            messagebox.showinfo("Tarea registrada", success_msg)
-
-    def _install_task(self):
-        script = Path(sys.argv[0]).resolve()
-        python = sys.executable
-        task_name = "RespaldoMensualAutomatico"
-        today_str = date.today().isoformat()
-        pc = get_pc_label()
-        # El trigger corre el dia 1 de cada mes a las 9AM.
-        # El programa mismo revisa si es dia habil (lun-sab);
-        # si el dia 1 es domingo simplemente no hace nada y espera el retry del dia 2.
-        xml = (
-            '<?xml version="1.0" encoding="UTF-16"?>\n'
-            '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
-            '  <RegistrationInfo><Description>Respaldo mensual - ' + pc + '</Description></RegistrationInfo>\n'
-            '  <Triggers>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>1</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>2</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>3</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>4</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>5</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>6</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>7</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>8</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>9</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>10</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>11</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '    <CalendarTrigger>\n'
-            '      <StartBoundary>' + today_str + 'T09:00:00</StartBoundary>\n'
-            '      <EndBoundary>2099-12-31T23:59:59</EndBoundary>\n'
-            '      <Enabled>true</Enabled>\n'
-            '      <ScheduleByMonth>\n'
-            '        <DaysOfMonth><Day>12</Day></DaysOfMonth>\n'
-            '        <Months><January/><February/><March/><April/><May/><June/>\n'
-            '                <July/><August/><September/><October/><November/><December/></Months>\n'
-            '      </ScheduleByMonth>\n'
-            '    </CalendarTrigger>\n'
-            '  </Triggers>\n'
-            '  <Settings>\n'
-            '    <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>\n'
-            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
-            '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n'
-            '    <ExecutionTimeLimit>PT8H</ExecutionTimeLimit>\n'
-            '    <Enabled>true</Enabled>\n'
-            '    <Hidden>true</Hidden>\n'
-            '    <StartWhenAvailable>true</StartWhenAvailable>\n'
-            '  </Settings>\n'
-            '  <Actions><Exec>\n'
-            '    <Command>' + str(python) + '</Command>\n'
-            '    <Arguments>"' + str(script) + '" --auto</Arguments>\n'
-            '  </Exec></Actions>\n'
-            '</Task>'
-        )
-        xml_path = Path.home() / "respaldo_task.xml"
-        xml_path.write_text(xml, encoding="utf-16")
-        ret = os.system('schtasks /Create /TN "' + task_name + '" /XML "' + str(xml_path) + '" /F')
-        xml_path.unlink(missing_ok=True)
-        if ret == 0:
-            messagebox.showinfo("Tarea instalada",
-                "Tarea registrada en Windows Task Scheduler.\n\n"
-                "Se ejecutara el ultimo dia de cada mes a las 8:00 AM.")
-        else:
-            messagebox.showerror("Error",
-                "No se pudo registrar la tarea.\nEjecuta como Administrador.")
-
-    def _disable_buttons(self):
-        self.btn_run.configure(state="disabled", text="Procesando...")
-        self.btn_force.configure(state="disabled")
-        self.live_log.configure(state="normal"); self.live_log.delete("1.0", "end")
-        self.live_log.configure(state="disabled"); self.progress["value"] = 0
-
-    def _enable_buttons(self):
-        self.btn_run.configure(state="normal", text="EJECUTAR RESPALDO AHORA")
-        self.btn_force.configure(state="normal")
-
-    def _start_backup(self):
-        if not self.cfg.get("share_root"):
-            messagebox.showwarning("Sin configurar", "Ve a Configuracion e ingresa la ruta de red.")
-            return
-        self._disable_buttons()
-        self.cfg["backup_thunderbird"] = self._tb_var.get()
-        threading.Thread(target=self._run_backup_thread, daemon=True).start()
-
-    def _start_backup_forced(self):
-        """Fuerza el respaldo ignorando checkpoint y restricciones de fecha."""
-        if not self.cfg.get("share_root"):
-            messagebox.showwarning("Sin configurar", "Ve a Configuracion e ingresa la ruta de red.")
-            return
-        if not messagebox.askyesno("Forzar respaldo",
-                "Borra el checkpoint y ejecuta desde cero, ignorando si ya fue completado. "
-                "Continuar?"):
-            return
-        start_d, _ = month_range()
-        _delete_checkpoint(start_d.strftime("%Y-%m"))
-        self.cfg.pop("last_backup_month", None)
-        self.cfg["retry_pending"] = False
-        save_config(self.cfg)
-        self._disable_buttons()
-        self.cfg["backup_thunderbird"] = self._tb_var.get()
-        threading.Thread(target=self._run_backup_thread, daemon=True).start()
-
-    def _run_backup_thread(self):
-        def cb(m): self.after(0, lambda msg=m: self._log(msg))
-        def prog(i, t):
-            self.after(0, lambda v=i, mx=t: (
-                self.progress.configure(maximum=mx, value=v),
-                self.lbl_prog.configure(text=str(v) + " / " + str(mx) + " archivos")))
-        try:
-            r = run_backup(self.cfg, status_cb=cb, count_cb=prog)
-            msg = "Listo.  " + str(r["files"]) + " archivos  ->  " + r["net_dest"]
-            self.after(0, lambda: self._log(msg, self.GREEN))
-        except Exception as e:
-            err = str(e)
-            self.after(0, lambda: self._log("Error: " + err, self.RED))
-        finally:
-            self.after(0, self._enable_buttons)
-            self.after(600, self._refresh_log_tab)
-
-# ───────────────────────────────────────────────
-if __name__ == "__main__":
-    if "--auto" in sys.argv:
-        # Ocultar ventana de consola si se abrio con python.exe en lugar de pythonw.exe
-        try:
-            import ctypes
-            ctypes.windll.user32.ShowWindow(
-                ctypes.windll.kernel32.GetConsoleWindow(), 0)  # 0 = SW_HIDE
-        except Exception:
+            while True:
+                s = q.get_nowait()
+                logbox.config(state="normal"); logbox.insert("end", s + "\n"); logbox.see("end")
+                logbox.config(state="disabled")
+        except queue.Empty:
             pass
-        check_and_run_headless()
+        root.after(200, pump)
+
+    def current_cfg():
+        c = load_cfg()
+        c.update({k: v.get().strip() for k, v in V.items()})
+        c.update(sources=list(lb.get(0, "end")), delete_local_after_send=v_del.get(),
+                 run_as_system=v_sys.get(),
+                 excluded_users=[x.strip() for x in v_excl.get().split(",") if x.strip()])
+        return c
+
+    def refresh_users():
+        c = current_cfg()
+        users = pick_target_users(c)
+        if users:
+            lbl_users.config(text="✔  Usuario detectado: " + ", ".join(u.name for u in users),
+                             foreground=C_GREEN)
+        else:
+            lbl_users.config(text="⚠  No se detecta ningún usuario (solo administradores en esta PC)",
+                             foreground=C_RED)
+        # Estado de Thunderbird
+        kind, msg = thunderbird_summary(c, users)
+        color = C_GREEN if kind == "ok" else (C_RED if kind == "error" else C_ORANGE)
+        lbl_tb.config(text="📧 " + msg, foreground=color)
+
+    def refresh_state():
+        c = load_cfg(); y, m = prev_month(); t = f"{y}-{m:02d}"; p = load_prog(t)
+        if c["last_done"] == t:
+            lbl_badge.config(text=f"✔  {t}: AL DÍA", bg=C_GREEN_BG, fg=C_GREEN)
+        elif p["collect_done"]:
+            lbl_badge.config(text=f"⏳  {t}: FALTA ENVIAR", bg=C_ORANGE_BG, fg=C_ORANGE)
+        elif p["files_done"] or p["mail"]:
+            lbl_badge.config(text=f"↻  {t}: EN PROCESO", bg=C_ORANGE_BG, fg=C_ORANGE)
+        else:
+            lbl_badge.config(text=f"⚠  {t}: PENDIENTE", bg=C_RED_BG, fg=C_RED)
+
+    def do_save(silent=False):
+        save_cfg(current_cfg())
+        if not silent:
+            log("✔ Configuración guardada.")
+        refresh_users()
+
+    def _set_running(running: bool):
+        """Cambia el aspecto de la ventana para que sea imposible no ver que está respaldando."""
+        if running:
+            root.title("⏳ Respaldando… — Respaldo Mensual")
+            lbl_badge.config(text="⏳  RESPALDANDO AHORA…", bg=C_ORANGE_BG, fg=C_ORANGE)
+            b_run.config(state="disabled", text="⏳  Respaldando…")
+            b_reset.config(state="disabled")
+            bar.start(8)
+            # Hacer el log visible sin que el usuario tenga que hacer scroll
+            canvas.yview_moveto(1.0)
+        else:
+            root.title("Respaldo Mensual")
+            b_run.config(state="normal", text="▶  Respaldar ahora")
+            b_reset.config(state="normal")
+            bar.stop()
+            refresh_state()
+
+    def _run(y, m, allow=True):
+        c = current_cfg(); save_cfg(c); cancel["v"] = False
+        _set_running(True)
+        log(f"{'─'*60}")
+        log(f"▶  Iniciando respaldo {y}-{m:02d}…")
+        log(f"{'─'*60}")
+
+        def work():
+            run_job(c, y, m, log, lambda: cancel["v"], collect_allowed=allow)
+            root.after(0, lambda: _set_running(False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_run():
+        do_save(silent=True); _run(v_year.get(), v_month.get())
+
+    def do_reset():
+        tag = f"{v_year.get()}-{v_month.get():02d}"
+        if messagebox.askyesno("Empezar de nuevo",
+                                f"Esto borra lo recopilado localmente de {tag} y vuelve a empezar. ¿Continuar?"):
+            reset_month(current_cfg(), tag); log(f"↻ Reiniciado {tag}."); do_run()
+
+    def do_test():
+        log("— Probando conexión —")
+        threading.Thread(target=lambda: test_destinations(current_cfg(), log), daemon=True).start()
+
+    def do_schedule():
+        do_save(silent=True)
+        if os.name != "nt":
+            messagebox.showinfo("Programar", "Esto requiere el Programador de tareas de Windows."); return
+        code, out = schedule_task(current_cfg()); log(f"Tarea programada ({code}): {out}")
+        if code == 0:
+            messagebox.showinfo("Programar", "Listo. El respaldo se repetirá solo cada mes, sin que tengas "
+                                 "que abrir este programa.")
+        else:
+            messagebox.showerror("Programar", f"No se pudo crear la tarea (¿ejecutas como administrador?):\n{out}")
+
+    # ---- barra de acciones ----
+    actions = ttk.Frame(root, style="TFrame"); actions.pack(fill="x", padx=16, pady=(4, 10))
+    b_run = ttk.Button(actions, text="▶  Respaldar ahora", style="Primary.TButton", command=do_run)
+    b_run.pack(side="left", padx=(0, 8))
+    b_reset = ttk.Button(actions, text="↻  Empezar de nuevo", style="Soft.TButton", command=do_reset)
+    b_reset.pack(side="left", padx=4)
+    ttk.Button(actions, text="⏹  Detener", style="Danger.TButton", command=lambda: cancel.update(v=True)
+               ).pack(side="left", padx=4)
+    ttk.Button(actions, text="📶  Probar conexión", style="Soft.TButton", command=do_test).pack(side="left", padx=4)
+    ttk.Button(actions, text="🗓  Programar automático", style="Soft.TButton", command=do_schedule
+               ).pack(side="left", padx=4)
+    ttk.Button(actions, text="💾  Guardar", style="Soft.TButton", command=do_save).pack(side="left", padx=4)
+
+    footer = ttk.Frame(root); footer.pack(fill="x", padx=16, pady=(0, 10))
+    ttk.Label(footer, text="El estado de todas las máquinas se revisa desde el panel del encargado en PC100.",
+              style="Muted.TLabel").pack(side="left")
+
+    refresh_state(); refresh_users(); pump()
+    root.mainloop()
+def main():
+    a = sys.argv[1:]
+    if "--instalar" in a:
+        sys.exit(install_silent(a))
+    elif "--catchup" in a:
+        run_auto("catchup")
+    elif "--auto" in a:
+        run_auto("auto")
+    elif "--vigilar" in a:
+        run_watch()
     else:
-        # Mostrar login antes de abrir el programa
-        login = LoginApp()
-        login.mainloop()
-        if login.resultado:
-            RespaldoApp().mainloop()
+        run_gui()
+
+
+if __name__ == "__main__":
+    main()
