@@ -22,6 +22,8 @@ from email.parser import BytesParser, HeaderParser
 from email import policy
 from datetime import datetime, date, timezone
 from pathlib import Path
+from email.generator import BytesGenerator
+from email.header import decode_header, make_header
 
 APP_DIR_NAME = "SyncAgent"              # nombre neutro: no debe llamar la atención en C:\ProgramData
 TASK_NAME = "SyncAgentTask"
@@ -59,9 +61,15 @@ for _p in (r"C:\Scans", r"C:\Scan", r"C:\Escaneos", r"C:\Escaner"):
         DEFAULTS["sources"].append(_p)
 
 SKIP_MAIL = {
-    "trash", "junk", "spam", "drafts", "draft", "deleted", "deleted items", "deleted messages",
-    "bin", "papelera", "borradores", "correo no deseado", "elementos eliminados", "basura",
-    "unsent messages", "bulk mail", "outbox", "bandeja de salida",
+    "trash", "junk", "spam", "drafts", "draft", "deleted",
+    "deleted items", "deleted messages", "bin", "papelera",
+    "borradores", "correo no deseado", "elementos eliminados",
+    "basura", "unsent messages", "bulk mail", "outbox",
+    "bandeja de salida", "all mail", "todos"
+}
+SENT_MAIL = {
+    "sent", "sent mail", "sent items", "enviados",
+    "elementos enviados", "correo enviado"
 }
 SKIP_DIRS = {"appdata", "$recycle.bin", "node_modules", ".git", "__pycache__"}
 
@@ -596,16 +604,71 @@ def collect(cfg, y, m, prog, log, stop):
         save_prog(tag, prog)
         log(f"  archivos nuevos copiados en total: {prog['files']}")
 
+
     tb_list = resolve_thunderbird(cfg, users)
+
     if tb_list:
+
+        account_number = 0
+
         for ulabel, tb in tb_list:
+
+            profile = Path(tb)
+
             for sub in ("ImapMail", "Mail"):
-                base = Path(tb) / sub
-                if base.is_dir():
-                    backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
-                                start, end, prog, tag, log, err, stop)
-        prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
+
+                base = profile / sub
+
+                if not base.is_dir():
+                    continue
+
+                # Cada carpeta de cuenta/servidor representa
+                # una cuenta de correo.
+                accounts = sorted(
+                    p for p in base.iterdir()
+                    if p.is_dir()
+                )
+
+                for account_dir in accounts:
+
+                    if stop():
+                        raise Stopped()
+
+                    #Ignorar carpetas especiales, no son cuentas de correo.
+                    if account_dir.name.lower() in {
+                        "local folders", "carpetas locales", "local folders.sbd"
+                    }:
+                        continue
+
+                    account_number += 1
+
+                    account_name = f"Correo {account_number}"
+
+                    log(
+                        f"Cuenta detectada: {account_name}"
+                    )
+
+                    backup_mail(
+                        account_dir,
+                        account_name,
+                        dest_root / "Correos" / account_name,
+                        start,
+                        end,
+                        prog,
+                        tag,
+                        log,
+                        err,
+                        stop
+                    )
+
+        prog["mails"] = sum(
+            s.get("count", 0)
+            for k, s in prog["mail"].items()
+            if k.startswith("EML/")
+        )
+
         log(f"  correos respaldados: {prog['mails']}")
+
     else:
         err("No se encontró perfil de Thunderbird del usuario objetivo.")
 
@@ -615,6 +678,79 @@ def collect(cfg, y, m, prog, log, stop):
 
 
 # ------------------------------------------------------------------ correo (streaming + puntos de control)
+def clean_mail_filename(value, max_length=120):
+    """Limpia nombres de asunto para que sean válidos en Windows."""
+    value = str(value or "").strip()
+
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+    value = re.sub(r"\s+", " ", value)
+    value = value.rstrip(". ")
+
+    # Evitar nombres reservados de Windows
+    if value.upper() in {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10))
+    }:
+        value = "_" + value
+
+    return (value[:max_length].rstrip(". ") or "Sin asunto")
+
+
+def get_mail_filename(message, raw):
+    """Genera fecha_asunto.eml a partir del mensaje original."""
+
+    try:
+        subject = str(
+            make_header(
+                decode_header(message.get("Subject", "Sin asunto"))
+            )
+        )
+    except Exception:
+        subject = "Sin asunto"
+
+    try:
+        msg_date = email.utils.parsedate_to_datetime(
+            message.get("Date", "")
+        )
+
+        if msg_date.tzinfo:
+            msg_date = msg_date.astimezone().replace(tzinfo=None)
+
+        date_text = msg_date.strftime("%Y-%m-%d")
+
+    except Exception:
+        date_text = "Sin-fecha"
+
+    subject = clean_mail_filename(subject)
+
+    # Huella para distinguir correos con el mismo asunto y fecha.
+    message_id = message.get("Message-ID", "")
+    fingerprint = hashlib.sha256(
+        (message_id or "").encode("utf-8") + raw
+    ).hexdigest()[:10]
+
+    return f"{date_text}_{subject}_{fingerprint}.eml"
+
+
+def get_mail_category(relative_path, filename):
+    """Determina si un buzón corresponde a enviados o recibidos."""
+
+    components = [
+        str(x).lower().replace(".sbd", "")
+        for x in relative_path.parts
+    ]
+
+    components.append(filename.lower())
+
+    if any(
+        component in SENT_MAIL
+        for component in components
+    ):
+        return "Enviados"
+
+    return "Recibidos"
+
 def is_mbox(p: Path):
     if p.suffix.lower() in (".msf", ".dat", ".json", ".sqlite", ".html", ".txt", ".bak"):
         return False
@@ -645,143 +781,388 @@ def _h(fh, pos, n):
     return d
 
 
-def filter_mbox(src, out, ids_path, start, end, seen, st, save, stop):
-    out.parent.mkdir(parents=True, exist_ok=True)
+def filter_mbox(src, out_dir, ids_path, start, end,
+                seen, st, save, stop):
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     ids_path.parent.mkdir(parents=True, exist_ok=True)
-    n, fout, new_ids, buf = 0, None, [], []
+
+    n = 0
+    new_ids = []
+    buf = []
+
     with open(src, "rb") as fh:
+
         head = hashlib.sha1(fh.read(4096)).hexdigest()
         off = st.get("offset", 0)
-        valid = (off > 0 and st.get("head") == head and os.path.getsize(src) >= off
-                 and _h(fh, off, 128) == st.get("tail")
-                 and (st.get("out_size", 0) == 0 or (out.exists() and out.stat().st_size >= st["out_size"])))
+
+        valid = (
+            off > 0
+            and st.get("version") == 2
+            and st.get("head") == head
+            and os.path.getsize(src) >= off
+            and _h(fh, off, 128) == st.get("tail")
+            and (
+                st.get("ids_size", 0) == 0
+                or (
+                    ids_path.exists()
+                    and ids_path.stat().st_size >= st["ids_size"]
+        )
+    )
+)
+
         if valid:
-            if out.exists():
-                with open(out, "r+b") as f:
-                    f.truncate(st.get("out_size", 0))
             if ids_path.exists():
                 with open(ids_path, "r+b") as f:
                     f.truncate(st.get("ids_size", 0))
-                seen.update(x.strip() for x in ids_path.read_text(encoding="utf-8").splitlines() if x.strip())
+
+                seen.update(
+                    x.strip()
+                    for x in ids_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if x.strip()
+                )
+
             n = st.get("count", 0)
+
         else:
             off = 0
-            out.unlink(missing_ok=True); ids_path.unlink(missing_ok=True)
+            ids_path.unlink(missing_ok=True)
+            st.clear()
+            n = 0
 
         def flush_ids():
+
             if new_ids:
+
                 with open(ids_path, "a", encoding="utf-8") as f:
+
                     f.write("\n".join(new_ids) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+
                 new_ids.clear()
 
         def checkpoint(boundary):
             flush_ids()
-            if fout:
-                fout.flush(); os.fsync(fout.fileno())
-            st.update(offset=boundary, count=n, head=head, tail=_h(fh, boundary, 128),
-                      out_size=out.stat().st_size if out.exists() else 0,
-                      ids_size=ids_path.stat().st_size if ids_path.exists() else 0)
+
+            st.update(
+                version=2,
+                offset=boundary,
+                count=n,
+                head=head,
+                tail=_h(fh, boundary, 128),
+                ids_size=(
+                    ids_path.stat().st_size
+                    if ids_path.exists() else 0
+                )
+            )
+
             save()
 
         def flush():
-            nonlocal n, fout
+
+            nonlocal n
+
             if not buf:
                 return
-            cut = next((i for i, l in enumerate(buf) if i > 0 and l.strip() == b""), len(buf))
-            hdr = BytesParser().parsebytes(b"".join(buf[1:cut]), headersonly=True)
-            try:
-                if int(hdr.get("X-Mozilla-Status", "0").strip() or "0", 16) & 0x0008:
-                    return
-            except ValueError:
-                pass
-            d = _date_of(hdr, buf[0])
-            if d is None or not (start <= d < end):
+
+            # Quitar la línea separadora propia del formato MBOX.
+            raw = b"".join(buf[1:])
+
+            if not raw:
                 return
-            mid = " ".join((hdr.get("Message-ID") or "").split())
-            if mid:
-                if mid in seen:
+
+            try:
+                message = BytesParser(
+                    policy=policy.default
+                ).parsebytes(raw)
+
+                # Respetar el filtro del mes que se respalda.
+                d = _date_of(message, buf[0])
+
+                if d is None or not (start <= d < end):
                     return
-                seen.add(mid); new_ids.append(mid)
-            if fout is None:
-                fout = open(out, "ab")
-            fout.writelines(buf)
-            if not buf[-1].endswith(b"\n"):
-                fout.write(b"\n")
-            if buf[-1].strip():
-                fout.write(b"\n")
-            n += 1
+
+                # Evitar mensajes marcados como eliminados.
+                try:
+                    status = int(
+                        message.get(
+                            "X-Mozilla-Status", "0"
+                        ).strip() or "0",
+                        16
+                    )
+
+                    if status & 0x0008:
+                        return
+
+                except (ValueError, AttributeError):
+                    pass
+
+                # Evitar duplicados mediante Message-ID.
+                mid = " ".join(
+                    (message.get("Message-ID") or "").split()
+                )
+
+                if mid and mid in seen:
+                    return
+
+                # Si no hay Message-ID, utilizar huella del contenido.
+                unique_id = mid or hashlib.sha256(raw).hexdigest()
+
+                if unique_id in seen:
+                    return
+
+                filename = get_mail_filename(message, raw)
+                output = out_dir / filename
+
+                # Escritura temporal para evitar EML incompletos.
+                part = output.with_name(output.name + ".part")
+
+                with open(part, "wb") as destination:
+                    generator = BytesGenerator(
+                        destination,
+                        policy=policy.default
+                    )
+
+                    generator.flatten(
+                        message,
+                        unixfrom=False
+                    )
+
+                    destination.flush()
+                    os.fsync(destination.fileno())
+
+                os.replace(part, output)
+
+                seen.add(unique_id)
+                new_ids.append(unique_id)
+                n += 1
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error al convertir mensaje de {src}: {e}"
+                ) from e
 
         try:
+
             fh.seek(off)
-            pos, prev_blank, last_ck = off, True, time.time()
+
+            pos = off
+            prev_blank = True
+            last_ck = time.time()
+            message_since_checkpoint = 0
+
+            
             while True:
+
                 line = fh.readline()
+
                 if not line:
                     break
+
+                # Detectar el inicio de un nuevo correo MBOX.
                 if prev_blank and line.startswith(b"From "):
+
+                    # Procesar el correo anterior.
                     flush()
-                    if time.time() - last_ck >= CK_SECONDS:
-                        checkpoint(pos); last_ck = time.time()
+
+                    # Contabilizar un mensaje terminado.
+                    messages_since_checkpoint += 1
+
+                    # Guardar progreso cada 15 segundos
+                    # o cada 25 mensajes procesados.
+                    if (
+                        time.time() - last_ck >= CK_SECONDS
+                        or messages_since_checkpoint >= 25
+                    ):
+
+                        checkpoint(pos)
+
+                        last_ck = time.time()
+                        messages_since_checkpoint = 0
+
                         if stop():
                             raise Stopped()
+
+                    # Comenzar el siguiente correo.
                     buf = [line]
+
                 else:
                     buf.append(line)
-                prev_blank = (line.strip() == b"")
+
+                prev_blank = line.strip() == b""
                 pos += len(line)
+
+
             flush()
+
             flush_ids()
-            st.update(done=True, count=n, offset=pos)
+
+            st.update(
+                version=2,
+                done=True,
+                count=n,
+                offset=pos,
+                head=head,
+                tail=_h(fh, pos, 128),
+                ids_size=(
+                    ids_path.stat().st_size
+                    if ids_path.exists() else 0
+                )
+            )
+
             save()
-        finally:
-            if fout:
-                fout.close()
+
+        except Stopped:
+            raise
+
     return n
 
 
-def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
+
+def backup_mail(base, sub, out_base, start, end,
+                prog, tag, log, err, stop):
+
     seen_cache = {}
-    ids_dir = PROG_DIR / f"{tag}_ids"
+
+    # Directorio independiente para identificadores de correos EML.
+    ids_dir = PROG_DIR / f"{tag}_eml_ids"
 
     def ids_file(key):
-        return ids_dir / (re.sub(r"[^\w.\-]+", "_", key) + ".txt")
+        filename = hashlib.sha256(
+        key.encode("utf-8")
+    ).hexdigest()
 
-    def seen_for(acct):
-        if acct not in seen_cache:
-            s = set()
-            for k, v in prog["mail"].items():
-                if v.get("done") and k.startswith(acct + "/") and ids_file(k).exists():
-                    s.update(x.strip() for x in ids_file(k).read_text(encoding="utf-8").splitlines() if x.strip())
-            seen_cache[acct] = s
-        return seen_cache[acct]
+        return ids_dir / f"{filename}.txt"
+
+
+def seen_for(account_id):
+
+    if account_id not in seen_cache:
+
+        seen = set()
+
+        prefix = f"EML/{account_id}/"
+
+        for key, state in prog["mail"].items():
+
+            # Solo consultar buzones de esta cuenta.
+            if not key.startswith(prefix):
+                continue
+
+            path = ids_file(key)
+
+            if not path.exists():
+                continue
+
+            # Recuperar únicamente los IDs confirmados
+            # en el último checkpoint.
+            saved_size = state.get("ids_size", 0)
+
+            with open(path, "r+b") as f:
+                f.truncate(saved_size)
+
+            with open(path, "r", encoding="utf-8") as f:
+                seen.update(
+                    line.strip()
+                    for line in f
+                    if line.strip()
+                )
+
+        seen_cache[account_id] = seen
+
+    return seen_cache[account_id]
+
+
+    base = Path(base)
 
     for root, dirs, files in os.walk(base):
+
+        if stop():
+            raise Stopped()
+
         rel = Path(root).relative_to(base)
-        parts = [x[:-4] if x.lower().endswith(".sbd") else x for x in rel.parts]
-        dirs[:] = sorted(d for d in dirs if (d[:-4] if d.lower().endswith(".sbd") else d).lower() not in SKIP_MAIL)
-        if any(x.lower() in SKIP_MAIL for x in parts):
+
+        dirs[:] = sorted(
+            d for d in dirs
+            if (
+                d[:-4] if d.lower().endswith(".sbd") else d
+            ).lower() not in SKIP_MAIL
+        )
+
+        if any(
+            x.lower() in SKIP_MAIL
+            for x in rel.parts
+        ):
             continue
-        acct = f"{sub}/{parts[0]}" if parts else sub
-        for f in sorted(files):
-            p = Path(root) / f
-            if f.lower() in SKIP_MAIL or not is_mbox(p):
+
+        for filename in sorted(files):
+
+            p = Path(root) / filename
+
+            if filename.lower() in SKIP_MAIL or not is_mbox(p):
                 continue
-            key = "/".join([sub] + parts + [f])
+
+            category = get_mail_category(rel, filename)
+
+            account_id = hashlib.sha256(
+                str(base.resolve()).lower().encode("utf-8")
+            ).hexdigest()[:16]
+
+            mailbox_id = hashlib.sha256(
+                str(p.resolve()).lower().encode("utf-8")
+            ).hexdigest()[:16]
+
+            key = f"EML/{account_id}/{mailbox_id}"
+
             st = prog["mail"].setdefault(key, {})
+
             if st.get("done"):
                 continue
+
             try:
-                if not st.get("offset") and p.stat().st_mtime < start.timestamp():
-                    st.update(done=True, count=0); continue
-                log(f"  Buzón {key}" + (" (retomando)" if st.get("offset") else ""))
-                c = filter_mbox(p, out_base.joinpath(*parts) / (f + ".mbox"), ids_file(key), start, end,
-                                seen_for(acct), st, lambda: save_prog(tag, prog), stop)
-                if c:
-                    log(f"    {c} correos")
+
+                if (
+                    not st.get("offset")
+                    and p.stat().st_mtime < start.timestamp()
+                ):
+                    st.update(done=True, count=0, version=2)
+                    save_prog(tag, prog)
+                    continue
+
+                destination = out_base / category
+
+                log(
+                    f"  {category}: {p.name}"
+                    + (
+                        " (retomando)"
+                        if st.get("offset") else ""
+                    )
+                )
+
+                count = filter_mbox(
+                    p,
+                    destination,
+                    ids_file(key),
+                    start,
+                    end,
+                    seen_for(account_id),
+                    st,
+                    lambda: save_prog(tag, prog),
+                    stop
+                )
+
+                if count:
+                    log(f"    {count} correos exportados")
+
             except Stopped:
                 raise
+
             except Exception as e:
                 err(f"Correo {key}: {e}")
+
     save_prog(tag, prog)
 
 
