@@ -24,6 +24,7 @@ from pathlib import Path
 from datetime import datetime, date
 
 from flask import Flask, request, redirect, url_for, session, jsonify, render_template_string
+from markupsafe import Markup
 
 APP_DIR_NAME = "PanelRespaldo"
 _PROGRAMDATA = os.environ.get("ProgramData")
@@ -364,7 +365,7 @@ function cargar(){
         div.className = 'card ' + m.estado;
         var errHtml = '';
         if(m.errores && m.errores.length){
-          errHtml = '<div class="errores">' + m.errores.slice(0,5).join('\n') + '</div>';
+          errHtml = '<div class="errores">' + m.errores.slice(0,5).join('<br>') + '</div>';
         }
         div.innerHTML =
           '<button class="btn-quitar" title="Quitar de la lista">\u2715</button>' +
@@ -381,8 +382,9 @@ function cargar(){
       });
       document.getElementById('resumen').textContent = ok + ' de ' + total + ' m\u00e1quinas respaldadas en ' + mes + '.';
     })
-    .catch(function(){
+    .catch(function(err){
       document.getElementById('aviso-red').style.display = 'block';
+      document.getElementById('resumen').textContent = 'No se pudo conectar. Recarga la página.';
     });
 }
 document.getElementById('buscar').addEventListener('input', cargar);
@@ -414,6 +416,19 @@ def logueado():
     return session.get("ok") is True
 
 
+
+@app.route("/api/diagnostico")
+def api_diagnostico():
+    d = estado_dir()
+    return jsonify({
+        "panel_ok": True,
+        "destino_root": CFG.get("destino_root", "(no configurado)"),
+        "carpeta_estado_existe": d.is_dir(),
+        "maquinas_registradas": len(get_maquinas()),
+        "maquinas": get_maquinas(),
+        "sesion_activa": logueado(),
+    })
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not CFG.get("destino_root"):
@@ -425,7 +440,7 @@ def login():
             session["ok"] = True
             return redirect(url_for("dashboard"))
         error = "Contraseña incorrecta."
-    return render_template_string(LOGIN_HTML, css=BASE_CSS, error=error)
+    return render_template_string(LOGIN_HTML, css=Markup(BASE_CSS), error=error)
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -443,7 +458,7 @@ def setup():
             CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
             save_cfg(CFG)
             return redirect(url_for("login"))
-    return render_template_string(SETUP_HTML, css=BASE_CSS, error=error, destino_root=CFG.get("destino_root", ""))
+    return render_template_string(SETUP_HTML, css=Markup(BASE_CSS), error=error, destino_root=CFG.get("destino_root", ""))
 
 
 @app.route("/logout")
@@ -458,7 +473,7 @@ def dashboard():
         return redirect(url_for("setup"))
     if not logueado():
         return redirect(url_for("login"))
-    return render_template_string(DASH_HTML, css=BASE_CSS, mes=prev_month_str())
+    return render_template_string(DASH_HTML, css=Markup(BASE_CSS), mes=prev_month_str())
 
 
 @app.route("/api/estado")
@@ -512,7 +527,7 @@ def esperadas_view():
     if request.method == "POST":
         guardar_esperadas(request.form.get("lista", ""))
         return redirect(url_for("dashboard"))
-    return render_template_string(ESPERADAS_HTML, css=BASE_CSS, lista=esperadas_texto())
+    return render_template_string(ESPERADAS_HTML, css=Markup(BASE_CSS), lista=esperadas_texto())
 
 
 @app.route("/config", methods=["GET", "POST"])
@@ -529,7 +544,7 @@ def config_view():
             CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
         save_cfg(CFG)
         return redirect(url_for("dashboard"))
-    return render_template_string(SETUP_HTML, css=BASE_CSS, error=error, destino_root=CFG.get("destino_root", ""))
+    return render_template_string(SETUP_HTML, css=Markup(BASE_CSS), error=error, destino_root=CFG.get("destino_root", ""))
 
 
 if __name__ == "__main__":

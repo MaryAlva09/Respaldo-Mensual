@@ -14,10 +14,13 @@ programada), esto funciona sin importar qué usuario tenga la sesión iniciada.
 FASE 1 (recopilar): copia lo del mes a una carpeta local oculta (no necesita red).
 FASE 2 (enviar):    la envía a PC100 (reintenta; retoma archivos y correos a medias).
 """
-import os, sys, json, glob, re, time, shutil, socket, hashlib, queue, threading, subprocess
+import os, sys, json, glob, re, time, shutil, socket, hashlib
+import queue, threading, subprocess, tempfile, mailbox, sqlite3
+import configparser
 import email.utils
-from email.parser import BytesParser
-from datetime import datetime, date
+from email.parser import BytesParser, HeaderParser
+from email import policy
+from datetime import datetime, date, timezone
 from pathlib import Path
 
 APP_DIR_NAME = "SyncAgent"              # nombre neutro: no debe llamar la atención en C:\ProgramData
@@ -145,24 +148,43 @@ def get_user_profiles():
     return out
 
 
+def _match_user(target_raw: str, profile_name: str) -> bool:
+    """
+    Coincidencia flexible entre el nombre de usuario objetivo configurado y
+    el nombre real de la carpeta en C:\\Users.
+
+    Ejemplos que deben coincidir:
+      "ULAPC 46"  ↔  "Ulapc46"   (el sistema guardó sin espacio)
+      "ULAPC 46"  ↔  "ULAPC 46"  (coincidencia exacta sin espacios)
+      "ulapc"     ↔  "Ulapc46"   (prefijo)
+    """
+    t = target_raw.lower()
+    p = profile_name.lower()
+    t_nsp = t.replace(" ", "")
+    p_nsp = p.replace(" ", "")
+    return (t in p) or (t_nsp in p_nsp) or (p in t) or (p_nsp in t_nsp)
+
+
 def pick_target_users(cfg, log=None):
     profiles = get_user_profiles()
-    target = cfg.get("target_user", "").strip().lower()
+    target = cfg.get("target_user", "").strip()
     if target:
-        cands = [d for d in profiles if target in d.name.lower()]
+        cands = [d for d in profiles if _match_user(target, d.name)]
         if not cands and log:
-            log(f"Usuario objetivo '{cfg['target_user']}' no encontrado. Perfiles en esta máquina: "
-                f"{[d.name for d in profiles]}")
+            log(f"Usuario objetivo '{target}' no encontrado. "
+                f"Perfiles en esta máquina: {[d.name for d in profiles]}. "
+                f"Prueba con solo la parte numérica (ej. '46') o el nombre exacto de la carpeta.")
         return cands
     excluded = [x.strip().lower() for x in cfg.get("excluded_users", []) if x.strip()]
     cands = [d for d in profiles if not any(x and x in d.name.lower() for x in excluded)]
     if log:
         if not cands:
-            log(f"ERROR: no se detectó un usuario distinto al administrador. Perfiles vistos: "
-                f"{[d.name for d in profiles]}. Define 'Usuario objetivo' manualmente.")
+            log(f"ERROR: no se detectó un usuario distinto al administrador. "
+                f"Perfiles vistos: {[d.name for d in profiles]}. "
+                f"Define 'Usuario objetivo' manualmente.")
         elif len(cands) > 1:
-            log(f"Aviso: hay {len(cands)} usuarios candidatos {[d.name for d in cands]}; se respaldan todos. "
-                f"Define 'Usuario objetivo' si solo quieres uno.")
+            log(f"Aviso: {len(cands)} usuarios candidatos {[d.name for d in cands]}; "
+                f"se respaldan todos. Define 'Usuario objetivo' si solo quieres uno.")
     return cands
 
 
@@ -268,6 +290,116 @@ def resolve_thunderbird(cfg, users):
     return out
 
 
+# ------------------------------------------------------------------
+# VERSION 5: IDENTIFICACION DE CUENTAS THUNDERBIRD
+
+def read_thunderbird_prefs(profile_path):
+    """
+    Lee las preferencias de Thunderbird.
+    No modifica prefs.js.
+    """
+    prefs = {}
+    prefs_file = Path(profile_path) / "prefs.js"
+
+    if not prefs_file.is_file():
+        return prefs
+
+    pattern = re.compile(
+        r'user_pref\("([^"]+)",\s*("(?:\\.|[^"\\])*"|[^)]+)\);'
+    )
+
+    try:
+        content = prefs_file.read_text(
+            encoding="utf-8",
+            errors="replace"
+        )
+
+        for key, value in pattern.findall(content):
+            value = value.strip()
+
+            if value.startswith('"'):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    value = value.strip('"')
+
+            prefs[key] = value
+
+    except Exception:
+        pass
+
+    return prefs
+
+
+def get_thunderbird_accounts(profile_path):
+    """
+    Identifica las cuentas configuradas en un perfil.
+    Devuelve etiquetas anonimizadas y sus almacenes.
+    """
+    prefs = read_thunderbird_prefs(profile_path)
+
+    account_ids = str(
+        prefs.get("mail.accountmanager.accounts", "")
+    ).split(",")
+
+    accounts = []
+
+    for account_id in account_ids:
+        account_id = account_id.strip()
+
+        if not account_id:
+            continue
+
+        server_id = prefs.get(
+            f"mail.account.{account_id}.server"
+        )
+
+        if not server_id:
+            continue
+
+        server_type = prefs.get(
+            f"mail.server.{server_id}.type", ""
+        )
+
+        if server_type not in ("imap", "pop3", "none"):
+            continue
+
+        directory = prefs.get(
+            f"mail.server.{server_id}.directory"
+        )
+
+        if not directory:
+            continue
+
+        directory = Path(str(directory))
+
+        if not directory.is_absolute():
+            directory = Path(profile_path) / directory
+
+        accounts.append({
+            "label": f"Correo {len(accounts) + 1}",
+            "server_id": server_id,
+            "type": server_type,
+            "directory": directory,
+        })
+
+    return accounts
+
+
+def get_account_folders(account):
+    """
+    Identifica carpetas de enviados y recibidos.
+    La clasificación definitiva se validará con
+    la configuración de carpetas especiales.
+    """
+    base = account["directory"]
+
+    return {
+        "base": base,
+        "exists": base.is_dir(),
+    }
+
+
 def thunderbird_summary(cfg, users):
     """
     Devuelve un texto descriptivo del estado de la detección de Thunderbird,
@@ -342,7 +474,17 @@ def unc_host(path):
 
 
 def destinations(cfg):
-    return [d.strip() for d in (cfg["destination"], cfg.get("destination_alt", "")) if d and d.strip()]
+    raw = [d.strip() for d in (cfg["destination"], cfg.get("destination_alt", "")) if d and d.strip()]
+    if os.name == "nt":
+        # Normalizar: convertir barras hacia adelante a backslash en rutas UNC de Windows.
+        # Ocurre cuando la ruta se guardó con / en lugar de \ en el JSON.
+        fixed = []
+        for d in raw:
+            if d.startswith("//") or d.startswith("\\\\"):
+                d = d.replace("/", "\\")
+            fixed.append(d)
+        return fixed
+    return raw
 
 
 def dest_reachable(dest):
@@ -698,31 +840,51 @@ def save_net_credentials_for_system(host, user, password, log=None):
 
 def mount_net_path(dest, user, password, log=None):
     """
-    Intenta montar la ruta de red usando 'net use' antes de copiar.
-    Esto funciona tanto para el usuario normal como para SYSTEM.
-    Si ya tiene acceso sin credenciales, 'net use' simplemente confirma la conexión.
+    Establece la conexión de red a PC100 usando 'net use' antes de copiar.
+
+    Maneja el error 1219 (conexión previa con distinto usuario) desconectando
+    primero y luego reconectando con las credenciales correctas.
     """
     if os.name != "nt":
         return
     host = _host_from_dest(dest)
     if not host:
         return
-    # Ruta base del servidor (\\IP o \\nombre)
     unc_base = f"\\\\{host}"
-    try:
+
+    def _connect():
         args = ["net", "use", unc_base]
         if user:
             args += [f"/user:{user}", password or ""]
         args += ["/persistent:no"]
-        r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        return subprocess.run(args, capture_output=True,
+                              text=True, encoding="cp850", errors="replace", timeout=15)
+
+    try:
+        r = _connect()
         if r.returncode == 0:
             if log:
                 log(f"Conexión con {unc_base} establecida correctamente")
-        elif "ya existe" in r.stdout.lower() or "already" in r.stdout.lower():
-            pass  # ya conectado
-        else:
+            return
+        out = (r.stdout + r.stderr).strip()
+        # Error 1219: conexión previa con otro usuario → desconectar y reintentar
+        if "1219" in out or "multiple" in out.lower() or "múltiples" in out.lower():
             if log:
-                log(f"  net use devolvió: {(r.stdout + r.stderr).strip()[:200]}")
+                log(f"  Desconectando sesión previa en {unc_base} (error 1219)…")
+            subprocess.run(["net", "use", unc_base, "/delete", "/yes"],
+                           capture_output=True, timeout=10)
+            time.sleep(1)
+            r2 = _connect()
+            if r2.returncode == 0:
+                if log:
+                    log(f"  Reconectado como {user or 'anónimo'}")
+                return
+            out = (r2.stdout + r2.stderr).strip()
+        # Ya conectado sin problema (mensajes de éxito en español/inglés)
+        if any(x in out.lower() for x in ("ya existe", "already", "se completó", "completed")):
+            return
+        if log and out:
+            log(f"  net use: {out[:250]}")
     except Exception as e:
         if log:
             log(f"  net use falló: {e}")
@@ -746,17 +908,23 @@ def send(cfg, tag, log):
         log(f"Enviando a {dst}")
         try:
             if shutil.which("robocopy"):
-                rl = CFG_DIR / "robocopy.log"
-                # Robocopy acepta credenciales implícitamente si la conexión ya está montada.
-                # /Z = modo reiniciable (retoma archivos parciales si se corta la red)
-                with open(rl, "w") as lf:
+                # Escribir el log de robocopy en %TEMP% (siempre accesible, sea cual
+                # sea el usuario que ejecuta la tarea: SYSTEM, admin o usuario normal)
+                import tempfile
+                rl = Path(tempfile.gettempdir()) / "respaldo_robocopy.log"
+                # /Z = modo reiniciable: retoma archivos parciales si se corta la red
+                with open(rl, "w", encoding="cp850", errors="replace") as lf:
                     rc = subprocess.call(
                         ["robocopy", str(src), str(dst),
                          "/E", "/COPY:DAT", "/R:3", "/W:10", "/Z",
                          "/NP", "/NDL", "/NFL", "/NJH"],
                         stdout=lf, stderr=lf)
                 if rc >= 8:
-                    why = f"robocopy código {rc}: " + rl.read_text(errors="replace")[-300:]
+                    try:
+                        tail = rl.read_text(encoding="cp850", errors="replace")[-400:]
+                    except Exception:
+                        tail = "(no se pudo leer el log)"
+                    why = f"robocopy código {rc}: {tail}"
                     log("  " + why); continue
             else:
                 shutil.copytree(src, dst, dirs_exist_ok=True)
@@ -1406,6 +1574,40 @@ def run_gui():
 
     refresh_state(); refresh_users(); pump()
     root.mainloop()
+
+
+def diagnostico_thunderbird():
+    users = get_user_profiles()
+
+    for user in users:
+        profiles = find_thunderbird_profiles(user)
+
+        for profile in profiles:
+            print("\nPERFIL:", profile)
+
+            accounts = get_thunderbird_accounts(profile)
+
+            for account in accounts:
+                print("CUENTA:", account["label"])
+                print("TIPO:", account["type"])
+                print("ALMACEN:", account["directory"])
+                print("EXISTE:", account["directory"].is_dir())
+
+            prefs = read_thunderbird_prefs(profile)
+
+            print("\nPREFERENCIAS DE CARPETAS:")
+
+            for key, value in prefs.items():
+                if any(x in key.lower() for x in (
+                    "fcc_folder",
+                    "sent_folder",
+                    "trash_folder",
+                    "draft_folder",
+                    "imapserver",
+                    "directory"
+                )):
+                    print(key, "=", value)
+
 def main():
     a = sys.argv[1:]
     if "--instalar" in a:
@@ -1416,6 +1618,8 @@ def main():
         run_auto("auto")
     elif "--vigilar" in a:
         run_watch()
+    elif "--diagnostico-tb" in a:
+        diagnostico_thunderbird()    
     else:
         run_gui()
 
