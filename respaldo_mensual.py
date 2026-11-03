@@ -635,7 +635,7 @@ def collect(cfg, y, m, prog, log, stop):
             for sub in ("ImapMail", "Mail"):
                 base = Path(tb) / sub
                 if base.is_dir():
-                    backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
+                    backup_mail(cfg, base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
                                 start, end, prog, tag, log, err, stop)
         prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
         log(f"  correos respaldados: {prog['mails']}")
@@ -846,7 +846,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
     return n
 
 
-def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
+def backup_mail(cfg, base, sub, out_base, start, end, prog, tag, log, err, stop):
     """
     Recorre todos los buzones de una cuenta de Thunderbird y exporta
     cada correo del mes como archivo .eml individual.
