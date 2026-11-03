@@ -374,7 +374,10 @@ function cargar(){
           '<div class="meta">\u00daltima vez: ' + (m.cuando||'\u2014') + '</div>' +
           '<div class="meta">Archivos: ' + (m.archivos==null?'\u2014':m.archivos) + ' &nbsp; Correos: ' + (m.correos==null?'\u2014':m.correos) + '</div>' +
           errHtml +
-          '<div class="acciones"><button class="btn btn-primary">&#x25b6; Respaldar ahora</button></div>';
+          '<div class="acciones">' +
+          '<button class="btn btn-primary">&#x25b6; Respaldar ahora</button>' +
+          '<a class="btn" href="/correos/' + encodeURIComponent(m.maquina) + '/' + mes + '">&#x1f4e7; Ver correos</a>' +
+          '</div>';
         var nombre = m.maquina;
         div.querySelector('.btn-quitar').onclick   = function(){ quitarMaquina(nombre); };
         div.querySelector('.btn-primary').onclick  = function(){ respaldarAhora(nombre); };
@@ -545,6 +548,268 @@ def config_view():
         save_cfg(CFG)
         return redirect(url_for("dashboard"))
     return render_template_string(SETUP_HTML, css=Markup(BASE_CSS), error=error, destino_root=CFG.get("destino_root", ""))
+
+
+# ──────────────────────────────────────────────── visor de correos ──
+import email as _email_mod
+import email.header as _email_hdr
+import html as _html_mod
+import io
+
+
+def _correos_root(maquina, mes):
+    return Path(CFG["destino_root"]) / maquina.strip() / mes.strip() / "Correos"
+
+
+def _parse_header(value):
+    """Decodifica encabezados MIME (Base64/QP) a texto legible."""
+    if not value:
+        return ""
+    try:
+        parts = _email_hdr.decode_header(value)
+        return str(_email_hdr.make_header(parts))
+    except Exception:
+        return str(value)
+
+
+def _list_emls(maquina, mes):
+    """
+    Devuelve lista de dicts con los metadatos de cada .eml
+    (carpeta, nombre, De, Para, Asunto, Fecha) sin leer el cuerpo.
+    """
+    root = _correos_root(maquina, mes)
+    result = []
+    if not root.is_dir():
+        return result
+    for carpeta_user in sorted(root.iterdir()):
+        if not carpeta_user.is_dir():
+            continue
+        for categoria in ("Recibidos", "Enviados"):
+            cat_dir = carpeta_user / categoria
+            if not cat_dir.is_dir():
+                continue
+            for eml in sorted(cat_dir.glob("*.eml"), reverse=True):
+                try:
+                    raw = eml.read_bytes()
+                    msg = _email_mod.message_from_bytes(raw)
+                    result.append({
+                        "carpeta": categoria,
+                        "cuenta": carpeta_user.name,
+                        "archivo": eml.name,
+                        "de": _parse_header(msg.get("From", "")),
+                        "para": _parse_header(msg.get("To", "")),
+                        "asunto": _parse_header(msg.get("Subject", "(sin asunto)")),
+                        "fecha": _parse_header(msg.get("Date", "")),
+                        "size": eml.stat().st_size,
+                    })
+                except Exception:
+                    pass
+    return result
+
+
+def _render_eml_body(msg):
+    """
+    Extrae el cuerpo del correo como HTML seguro para mostrarlo en el navegador.
+    Prefiere la parte HTML; cae a texto plano si no hay HTML.
+    """
+    def get_charset(part):
+        cs = part.get_content_charset()
+        return cs if cs else "utf-8"
+
+    html_body = plain_body = None
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/html" and html_body is None:
+                try:
+                    html_body = part.get_payload(decode=True).decode(get_charset(part), errors="replace")
+                except Exception:
+                    pass
+            elif ct == "text/plain" and plain_body is None:
+                try:
+                    plain_body = part.get_payload(decode=True).decode(get_charset(part), errors="replace")
+                except Exception:
+                    pass
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                text = payload.decode(get_charset(msg), errors="replace")
+                if msg.get_content_type() == "text/html":
+                    html_body = text
+                else:
+                    plain_body = text
+        except Exception:
+            pass
+
+    if html_body:
+        # Eliminar <script> y <style> externos para seguridad básica
+        import re as _re
+        html_body = _re.sub(r'<script[\s\S]*?</script>', '', html_body, flags=_re.IGNORECASE)
+        html_body = _re.sub(r'<link[^>]+>', '', html_body, flags=_re.IGNORECASE)
+        return html_body, "html"
+    if plain_body:
+        return "<pre style='white-space:pre-wrap;font-family:inherit'>" + _html_mod.escape(plain_body) + "</pre>", "plain"
+    return "<p style='color:#888'>Sin contenido visible.</p>", "empty"
+
+
+def _list_attachments(msg):
+    """Lista de adjuntos con nombre y tamaño."""
+    atts = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                name = _parse_header(part.get_filename() or "adjunto")
+                payload = part.get_payload(decode=True) or b""
+                atts.append({"nombre": name, "size": len(payload)})
+    return atts
+
+
+@app.route("/correos/<maquina>/<mes>")
+def correos_lista(maquina, mes):
+    if not logueado():
+        return redirect(url_for("login"))
+    emls = _list_emls(maquina, mes)
+    filas = ""
+    for e in emls:
+        url = url_for("correos_ver", maquina=maquina, mes=mes,
+                      cuenta=e["cuenta"], carpeta=e["carpeta"], archivo=e["archivo"])
+        badge = ("#16A34A" if e["carpeta"] == "Recibidos" else "#2563EB")
+        filas += (
+            f'<tr onclick="location.href=\'{url}\'" style="cursor:pointer">'
+            f'<td><span style="background:{badge};color:#fff;padding:2px 8px;border-radius:99px;'
+            f'font-size:11px">{_html_mod.escape(e["carpeta"])}</span></td>'
+            f'<td>{_html_mod.escape(e["asunto"])}</td>'
+            f'<td style="color:#555;font-size:13px">{_html_mod.escape(e["de"][:60])}</td>'
+            f'<td style="color:#555;font-size:13px;white-space:nowrap">{_html_mod.escape(e["fecha"][:20])}</td>'
+            f'</tr>'
+        )
+    volver = url_for("dashboard")
+    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
+<title>Correos — {_html_mod.escape(maquina)} {_html_mod.escape(mes)}</title>
+<style>{BASE_CSS}
+table{{width:100%;border-collapse:collapse}}
+th{{text-align:left;padding:8px 12px;background:#EFF6FF;color:#1D4ED8;font-size:13px}}
+td{{padding:9px 12px;border-bottom:1px solid #E5EDFB;font-size:14px;max-width:300px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+tr:hover td{{background:#F0F7FF}}
+.num{{color:#6B7280;font-size:13px}}
+</style></head><body>
+<header>
+  <h1 style="margin:0">📧 Correos — {_html_mod.escape(maquina)} / {_html_mod.escape(mes)}</h1>
+  <a class="logout" href="{volver}">← Volver al panel</a>
+</header>
+<div class="wrap">
+  <p class="num">{len(emls)} correo(s) respaldado(s)</p>
+  <table>
+    <thead><tr><th>Carpeta</th><th>Asunto</th><th>De</th><th>Fecha</th></tr></thead>
+    <tbody>{filas if filas else '<tr><td colspan="4" style="color:#888;padding:20px">No hay correos respaldados para este mes.</td></tr>'}</tbody>
+  </table>
+</div></body></html>"""
+    return html
+
+
+@app.route("/correos/<maquina>/<mes>/<cuenta>/<carpeta>/<archivo>")
+def correos_ver(maquina, mes, cuenta, carpeta, archivo):
+    if not logueado():
+        return redirect(url_for("login"))
+    # Validar que el archivo esté dentro de la ruta esperada (sin path traversal)
+    root = _correos_root(maquina, mes)
+    eml_path = (root / cuenta / carpeta / archivo).resolve()
+    if not str(eml_path).startswith(str(root.resolve())):
+        return "Ruta no permitida", 403
+    if not eml_path.exists() or eml_path.suffix.lower() != ".eml":
+        return "Correo no encontrado", 404
+    try:
+        raw = eml_path.read_bytes()
+        msg = _email_mod.message_from_bytes(raw)
+    except Exception as e:
+        return f"Error al leer el correo: {e}", 500
+
+    asunto = _parse_header(msg.get("Subject", "(sin asunto)"))
+    de = _parse_header(msg.get("From", ""))
+    para = _parse_header(msg.get("To", ""))
+    cc = _parse_header(msg.get("Cc", ""))
+    fecha = _parse_header(msg.get("Date", ""))
+    body_html, body_type = _render_eml_body(msg)
+    adjuntos = _list_attachments(msg)
+    lista_url = url_for("correos_lista", maquina=maquina, mes=mes)
+
+    adj_html = ""
+    if adjuntos:
+        items = "".join(f'<li>📎 {_html_mod.escape(a["nombre"])} ({a["size"]//1024} KB)</li>'
+                        for a in adjuntos)
+        adj_html = f'<div style="background:#FEF3C7;padding:10px 16px;border-radius:8px;margin:12px 0"><b>Adjuntos:</b><ul style="margin:4px 0 0 16px">{items}</ul></div>'
+
+    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
+<title>{_html_mod.escape(asunto)}</title>
+<style>{BASE_CSS}
+.cabecera{{background:#fff;border:1px solid #D7E2F2;border-radius:10px;
+           padding:16px 20px;margin-bottom:16px}}
+.cabecera .etiq{{color:#6B7280;font-size:12px;width:60px;display:inline-block}}
+.cabecera .val{{font-size:14px}}
+.cuerpo{{background:#fff;border:1px solid #D7E2F2;border-radius:10px;
+         padding:20px;min-height:200px;overflow-x:auto}}
+</style></head><body>
+<header>
+  <h1 style="margin:0;font-size:17px">📧 {_html_mod.escape(asunto)}</h1>
+  <a class="logout" href="{lista_url}">← Volver a la lista</a>
+</header>
+<div class="wrap">
+  <div class="cabecera">
+    <div><span class="etiq">De:</span> <span class="val">{_html_mod.escape(de)}</span></div>
+    <div><span class="etiq">Para:</span> <span class="val">{_html_mod.escape(para)}</span></div>
+    {'<div><span class="etiq">CC:</span> <span class="val">' + _html_mod.escape(cc) + '</span></div>' if cc else ''}
+    <div><span class="etiq">Fecha:</span> <span class="val">{_html_mod.escape(fecha)}</span></div>
+    <div><span class="etiq">Carpeta:</span> <span class="val">{_html_mod.escape(carpeta)}</span></div>
+  </div>
+  {adj_html}
+  <div class="cuerpo">{body_html}</div>
+</div></body></html>"""
+    return html
+
+
+@app.route("/api/progreso")
+def api_progreso():
+    """
+    Devuelve el progreso en tiempo real de todas las máquinas que están
+    respaldando ahora mismo. Actualiza solo las que tienen archivo _progreso.json
+    con menos de 5 minutos de antigüedad.
+    """
+    if not logueado():
+        return jsonify({}), 401
+    d = estado_dir()
+    result = {}
+    STALE_SECS = 5 * 60   # si no actualizó en 5 min, el proceso se interrumpió
+    try:
+        if not d.is_dir():
+            return jsonify({})
+        for fp in d.glob("*_progreso.json"):
+            machine = fp.stem.replace("_progreso", "")
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                # Verificar antigüedad
+                upd = datetime.strptime(data["actualizado"], "%Y-%m-%d %H:%M:%S")
+                age = (datetime.now() - upd).total_seconds()
+                if age > STALE_SECS:
+                    data["etapa"] = "interrumpido"
+                    data["detalle"] = f"Sin actualización hace {int(age//60)} min"
+                data["segundos_desde_update"] = int(age)
+                result[machine] = data
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return jsonify(result)
+
+
+@app.route("/api/correos/<maquina>/<mes>")
+def api_correos(maquina, mes):
+    """API JSON: lista de correos de una máquina y mes para usar desde el dashboard."""
+    if not logueado():
+        return jsonify({"error": "no autorizado"}), 401
+    emls = _list_emls(maquina, mes)
+    return jsonify({"total": len(emls), "correos": emls})
 
 
 if __name__ == "__main__":

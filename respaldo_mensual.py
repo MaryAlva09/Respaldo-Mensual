@@ -14,16 +14,14 @@ programada), esto funciona sin importar qué usuario tenga la sesión iniciada.
 FASE 1 (recopilar): copia lo del mes a una carpeta local oculta (no necesita red).
 FASE 2 (enviar):    la envía a PC100 (reintenta; retoma archivos y correos a medias).
 """
-import os, sys, json, glob, re, time, shutil, socket, hashlib
-import queue, threading, subprocess, tempfile, mailbox, sqlite3
-import configparser
+import os, sys, json, glob, re, time, shutil, socket, hashlib, queue, threading, subprocess
 import email.utils
-from email.parser import BytesParser, HeaderParser
-from email import policy
-from datetime import datetime, date, timezone
-from pathlib import Path
+from email.parser import BytesParser
+from email import policy as email_policy
 from email.generator import BytesGenerator
 from email.header import decode_header, make_header
+from datetime import datetime, date
+from pathlib import Path
 
 APP_DIR_NAME = "SyncAgent"              # nombre neutro: no debe llamar la atención en C:\ProgramData
 TASK_NAME = "SyncAgentTask"
@@ -52,8 +50,12 @@ DEFAULTS = {
     "target_user": "",                                 # vacío = autodetectar (excluye excluded_users)
     "excluded_users": ["propietario", "administrador", "administrator", "admin", "wdagutilityaccount"],
     "run_as_system": True,
-    "net_user": "",   # usuario de la carpeta compartida de PC100, ej. PC100\respaldo
-    "net_pass": "",   # contraseña (se guarda en config.json; para mayor seguridad usa cmdkey manualmente)
+    "net_user": "",
+    "net_pass": "",
+    # Carpetas adicionales a excluir (además de SKIP_DIRS). Se pueden agregar desde la GUI.
+    "extra_skip_dirs": [],
+    # Extensiones adicionales a excluir (además de SKIP_EXT).
+    "extra_skip_ext": [],
     "last_done": "", "last_status": "", "last_attempt": "",
 }
 for _p in (r"C:\Scans", r"C:\Scan", r"C:\Escaneos", r"C:\Escaner"):
@@ -61,21 +63,82 @@ for _p in (r"C:\Scans", r"C:\Scan", r"C:\Escaneos", r"C:\Escaner"):
         DEFAULTS["sources"].append(_p)
 
 SKIP_MAIL = {
-    "trash", "junk", "spam", "drafts", "draft", "deleted",
-    "deleted items", "deleted messages", "bin", "papelera",
-    "borradores", "correo no deseado", "elementos eliminados",
-    "basura", "unsent messages", "bulk mail", "outbox",
-    "bandeja de salida", "all mail", "todos"
+    "trash", "junk", "spam", "drafts", "draft", "deleted", "deleted items", "deleted messages",
+    "bin", "papelera", "borradores", "correo no deseado", "elementos eliminados", "basura",
+    "unsent messages", "bulk mail", "outbox", "bandeja de salida",
 }
-SENT_MAIL = {
-    "sent", "sent mail", "sent items", "enviados",
-    "elementos enviados", "correo enviado"
+SKIP_DIRS = {
+    # Sistema operativo y aplicaciones
+    "appdata", "$recycle.bin", "node_modules", ".git", "__pycache__",
+    # Carpetas de sistema o fabricante que aparecen en Documentos / Escritorio
+    "dellsuport", "dell support", "dell supportassist", "supportassist",
+    "hp support assistant", "lenovo", "lenovo vantage",
+    "my dell", "dell",
+    # Carpetas de Office/Windows que no son del usuario
+    "plantillas personalizadas de office", "custom office templates",
+    "mis fuentes de datos", "my data sources",
+    "bases de datos de outlook", "outlook files",
+    "onenote notebooks", "cuadernos de onenote",
+    "teams", "microsoft teams",
+    # Carpetas de diagnóstico y soporte técnico
+    "diagnostics", "crash reports", "crashreports",
+    "windows error reporting",
 }
-SKIP_DIRS = {"appdata", "$recycle.bin", "node_modules", ".git", "__pycache__"}
+
+# Extensiones de archivo que nunca se respaldan:
+# ejecutables, accesos directos, archivos temporales y de sistema.
+SKIP_EXT = {
+    # Accesos directos y lanzadores
+    ".lnk", ".url", ".webloc",
+    # Ejecutables e instaladores
+    ".exe", ".msi", ".msp", ".msix", ".appx",
+    ".dll", ".sys", ".drv", ".ocx", ".scr",
+    ".com", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".js", ".wsf",
+    # Temporales y caché del sistema
+    ".tmp", ".temp", ".bak", ".old", ".log", ".etl",
+    ".thumbs",
+    # Archivos de base de datos de miniaturas
+    "thumbs.db", "desktop.ini", ".ds_store",
+}
 
 
 class Stopped(Exception):
     pass
+
+
+def effective_skip_dirs(cfg):
+    """Combina las carpetas fijas del sistema con las que configuró el usuario."""
+    extra = {x.strip().lower() for x in cfg.get("extra_skip_dirs", []) if x.strip()}
+    return SKIP_DIRS | extra
+
+
+def effective_skip_ext(cfg):
+    """Combina las extensiones fijas con las que configuró el usuario."""
+    extra = {(x.strip().lower() if x.strip().startswith(".") else "." + x.strip().lower())
+             for x in cfg.get("extra_skip_ext", []) if x.strip()}
+    return SKIP_EXT | extra
+
+
+def should_skip_file(path: Path, skip_ext: set) -> bool:
+    """
+    Devuelve True si el archivo NO debe respaldarse.
+    Criterios:
+      - Extensión en la lista de exclusión (.lnk, .exe, etc.)
+      - Nombre exacto en la lista de exclusión (thumbs.db, desktop.ini, .ds_store)
+      - Archivo de sistema de Windows (atributo oculto+sistema, solo se verifica nombre)
+    """
+    name_lower = path.name.lower()
+    ext_lower  = path.suffix.lower()
+    # Nombres especiales que están en el set como nombre completo
+    if name_lower in skip_ext:
+        return True
+    # Extensiones
+    if ext_lower in skip_ext:
+        return True
+    # Nombres de sistema frecuentes que no tienen extensión estándar
+    if name_lower in {"desktop.ini", "thumbs.db", ".ds_store", "autorun.inf"}:
+        return True
+    return False
 
 
 # ------------------------------------------------------------------ config
@@ -298,116 +361,6 @@ def resolve_thunderbird(cfg, users):
     return out
 
 
-# ------------------------------------------------------------------
-# VERSION 5: IDENTIFICACION DE CUENTAS THUNDERBIRD
-
-def read_thunderbird_prefs(profile_path):
-    """
-    Lee las preferencias de Thunderbird.
-    No modifica prefs.js.
-    """
-    prefs = {}
-    prefs_file = Path(profile_path) / "prefs.js"
-
-    if not prefs_file.is_file():
-        return prefs
-
-    pattern = re.compile(
-        r'user_pref\("([^"]+)",\s*("(?:\\.|[^"\\])*"|[^)]+)\);'
-    )
-
-    try:
-        content = prefs_file.read_text(
-            encoding="utf-8",
-            errors="replace"
-        )
-
-        for key, value in pattern.findall(content):
-            value = value.strip()
-
-            if value.startswith('"'):
-                try:
-                    value = json.loads(value)
-                except Exception:
-                    value = value.strip('"')
-
-            prefs[key] = value
-
-    except Exception:
-        pass
-
-    return prefs
-
-
-def get_thunderbird_accounts(profile_path):
-    """
-    Identifica las cuentas configuradas en un perfil.
-    Devuelve etiquetas anonimizadas y sus almacenes.
-    """
-    prefs = read_thunderbird_prefs(profile_path)
-
-    account_ids = str(
-        prefs.get("mail.accountmanager.accounts", "")
-    ).split(",")
-
-    accounts = []
-
-    for account_id in account_ids:
-        account_id = account_id.strip()
-
-        if not account_id:
-            continue
-
-        server_id = prefs.get(
-            f"mail.account.{account_id}.server"
-        )
-
-        if not server_id:
-            continue
-
-        server_type = prefs.get(
-            f"mail.server.{server_id}.type", ""
-        )
-
-        if server_type not in ("imap", "pop3", "none"):
-            continue
-
-        directory = prefs.get(
-            f"mail.server.{server_id}.directory"
-        )
-
-        if not directory:
-            continue
-
-        directory = Path(str(directory))
-
-        if not directory.is_absolute():
-            directory = Path(profile_path) / directory
-
-        accounts.append({
-            "label": f"Correo {len(accounts) + 1}",
-            "server_id": server_id,
-            "type": server_type,
-            "directory": directory,
-        })
-
-    return accounts
-
-
-def get_account_folders(account):
-    """
-    Identifica carpetas de enviados y recibidos.
-    La clasificación definitiva se validará con
-    la configuración de carpetas especiales.
-    """
-    base = account["directory"]
-
-    return {
-        "base": base,
-        "exists": base.is_dir(),
-    }
-
-
 def thunderbird_summary(cfg, users):
     """
     Devuelve un texto descriptivo del estado de la detección de Thunderbird,
@@ -554,6 +507,59 @@ def write_status(cfg, tag, res, dest):
         pass
 
 
+_prog_report_cache = {"dest": None, "ok": False}
+
+
+def report_progress(cfg, etapa, detalle, archivos=0, correos=0, dest=None):
+    """
+    Escribe el estado actual del respaldo en la carpeta compartida de PC100
+    para que el panel del administrador lo muestre en tiempo real.
+
+    etapa:   "archivos" | "correos" | "enviando" | "listo" | "error"
+    detalle: texto libre, ej. "Buzón INBOX — 340 correos hasta ahora"
+    """
+    target = dest or _prog_report_cache.get("dest")
+    if not target:
+        # Intentar encontrar el primer destino accesible
+        for d in destinations(cfg):
+            ok, _ = dest_reachable(d)
+            if ok:
+                _prog_report_cache["dest"] = d
+                target = d
+                break
+    if not target:
+        return   # sin red, no se puede reportar; no es un error
+    try:
+        estado_dir = Path(target) / "_estado"
+        estado_dir.mkdir(parents=True, exist_ok=True)
+        machine = cfg["machine_name"].strip()
+        fp = estado_dir / f"{machine}_progreso.json"
+        data = {
+            "maquina":     machine,
+            "etapa":       etapa,
+            "detalle":     detalle,
+            "archivos":    archivos,
+            "correos":     correos,
+            "actualizado": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # Escritura atómica para que el panel nunca lea un JSON a medias
+        tmp = fp.with_name(fp.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, fp)
+    except Exception:
+        pass
+
+
+def clear_progress(cfg, dest=None):
+    """Borra el archivo de progreso cuando el respaldo termina."""
+    for d in ([dest] if dest else destinations(cfg)):
+        try:
+            fp = Path(d) / "_estado" / f"{cfg['machine_name'].strip()}_progreso.json"
+            fp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 # ------------------------------------------------------------------ FASE 1: recopilar (local)
 def local_dir(cfg, tag):
     return Path(cfg["local_root"]) / cfg["machine_name"].strip() / tag
@@ -574,18 +580,32 @@ def collect(cfg, y, m, prog, log, stop):
     log(f"== Recopilando {tag} — usuario(s) objetivo: {[u.name for u in users] or 'NINGUNO'}")
     all_sources = [(Path(e).name or Path(e).drive.replace(":", ""), Path(e)) for e in extra] + user_sources
 
+    skip_dirs = effective_skip_dirs(cfg)
+    skip_ext  = effective_skip_ext(cfg)
+
     if not prog["files_done"]:
+        skipped_ext = 0
+        report_progress(cfg, "archivos", "Iniciando copia de archivos…",
+                        archivos=prog["files"], correos=prog["mails"])
         for label, sp in all_sources:
             if not sp.is_dir():
                 log(f"(omitido, no existe) {sp}"); continue
             log(f"Archivos: {sp}")
+            report_progress(cfg, "archivos", f"Copiando {sp.name}…",
+                            archivos=prog["files"], correos=prog["mails"])
             for root, dirs, files in os.walk(sp):
-                dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS
+                # Excluir carpetas de sistema, soporte técnico y las configuradas por el usuario
+                dirs[:] = [d for d in dirs
+                           if d.lower() not in skip_dirs
                            and os.path.normcase(os.path.abspath(os.path.join(root, d))) != lr]
                 for f in files:
                     if stop():
                         raise Stopped()
                     p = Path(root) / f
+                    # Excluir accesos directos, ejecutables, temporales y archivos de sistema
+                    if should_skip_file(p, skip_ext):
+                        skipped_ext += 1
+                        continue
                     try:
                         st = p.stat()
                         if not (ts0 <= st.st_mtime < ts1):
@@ -600,75 +620,25 @@ def collect(cfg, y, m, prog, log, stop):
                         prog["files"] += 1
                     except Exception as e:
                         err(f"Archivo {p}: {e}")
+        if skipped_ext:
+            log(f"  {skipped_ext} archivos omitidos por extensión o tipo "
+                f"(.lnk, .exe, carpetas de sistema, etc.)")
         prog["files_done"] = not errors
         save_prog(tag, prog)
         log(f"  archivos nuevos copiados en total: {prog['files']}")
-
+        report_progress(cfg, "correos", "Archivos listos, preparando correos…",
+                        archivos=prog["files"], correos=0)
 
     tb_list = resolve_thunderbird(cfg, users)
-
     if tb_list:
-
-        account_number = 0
-
         for ulabel, tb in tb_list:
-
-            profile = Path(tb)
-
             for sub in ("ImapMail", "Mail"):
-
-                base = profile / sub
-
-                if not base.is_dir():
-                    continue
-
-                # Cada carpeta de cuenta/servidor representa
-                # una cuenta de correo.
-                accounts = sorted(
-                    p for p in base.iterdir()
-                    if p.is_dir()
-                )
-
-                for account_dir in accounts:
-
-                    if stop():
-                        raise Stopped()
-
-                    #Ignorar carpetas especiales, no son cuentas de correo.
-                    if account_dir.name.lower() in {
-                        "local folders", "carpetas locales", "local folders.sbd"
-                    }:
-                        continue
-
-                    account_number += 1
-
-                    account_name = f"Correo {account_number}"
-
-                    log(
-                        f"Cuenta detectada: {account_name}"
-                    )
-
-                    backup_mail(
-                        account_dir,
-                        account_name,
-                        dest_root / "Correos" / account_name,
-                        start,
-                        end,
-                        prog,
-                        tag,
-                        log,
-                        err,
-                        stop
-                    )
-
-        prog["mails"] = sum(
-            s.get("count", 0)
-            for k, s in prog["mail"].items()
-            if k.startswith("EML/")
-        )
-
+                base = Path(tb) / sub
+                if base.is_dir():
+                    backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
+                                start, end, prog, tag, log, err, stop)
+        prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
         log(f"  correos respaldados: {prog['mails']}")
-
     else:
         err("No se encontró perfil de Thunderbird del usuario objetivo.")
 
@@ -677,80 +647,56 @@ def collect(cfg, y, m, prog, log, stop):
     save_prog(tag, prog)
 
 
-# ------------------------------------------------------------------ correo (streaming + puntos de control)
-def clean_mail_filename(value, max_length=120):
-    """Limpia nombres de asunto para que sean válidos en Windows."""
-    value = str(value or "").strip()
+# ------------------------------------------------------------------ correo: nombres y categorías .eml
+SENT_MAIL = {
+    "sent", "sent mail", "sent messages", "enviados", "correo enviado",
+    "elementos enviados", "outbox", "bandeja de salida",
+}
 
+
+def clean_mail_filename(value, max_length=120):
+    """Limpia un asunto para que sea un nombre de archivo válido en Windows."""
+    value = str(value or "").strip()
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
     value = re.sub(r"\s+", " ", value)
     value = value.rstrip(". ")
-
-    # Evitar nombres reservados de Windows
-    if value.upper() in {
-        "CON", "PRN", "AUX", "NUL",
-        *(f"COM{i}" for i in range(1, 10)),
-        *(f"LPT{i}" for i in range(1, 10))
-    }:
+    if value.upper() in {"CON", "PRN", "AUX", "NUL",
+                         *(f"COM{i}" for i in range(1, 10)),
+                         *(f"LPT{i}" for i in range(1, 10))}:
         value = "_" + value
+    return (value[:max_length].rstrip(". ") or "Sin_asunto")
 
-    return (value[:max_length].rstrip(". ") or "Sin asunto")
 
-
-def get_mail_filename(message, raw):
-    """Genera fecha_asunto.eml a partir del mensaje original."""
-
+def get_mail_filename(message, raw: bytes) -> str:
+    """Genera un nombre único y legible: AAAA-MM-DD_Asunto_huella.eml"""
     try:
-        subject = str(
-            make_header(
-                decode_header(message.get("Subject", "Sin asunto"))
-            )
-        )
+        subject = str(make_header(decode_header(message.get("Subject", "Sin asunto"))))
     except Exception:
         subject = "Sin asunto"
-
     try:
-        msg_date = email.utils.parsedate_to_datetime(
-            message.get("Date", "")
-        )
-
+        msg_date = email.utils.parsedate_to_datetime(message.get("Date", ""))
         if msg_date.tzinfo:
             msg_date = msg_date.astimezone().replace(tzinfo=None)
-
         date_text = msg_date.strftime("%Y-%m-%d")
-
     except Exception:
         date_text = "Sin-fecha"
-
     subject = clean_mail_filename(subject)
-
-    # Huella para distinguir correos con el mismo asunto y fecha.
-    message_id = message.get("Message-ID", "")
     fingerprint = hashlib.sha256(
-        (message_id or "").encode("utf-8") + raw
+        (message.get("Message-ID") or "").encode("utf-8") + raw
     ).hexdigest()[:10]
-
     return f"{date_text}_{subject}_{fingerprint}.eml"
 
 
-def get_mail_category(relative_path, filename):
-    """Determina si un buzón corresponde a enviados o recibidos."""
-
-    components = [
-        str(x).lower().replace(".sbd", "")
-        for x in relative_path.parts
-    ]
-
-    components.append(filename.lower())
-
-    if any(
-        component in SENT_MAIL
-        for component in components
-    ):
+def get_mail_category(relative_path: Path, filename: str) -> str:
+    """Devuelve 'Enviados' o 'Recibidos' según la carpeta del buzón."""
+    parts = [str(x).lower().replace(".sbd", "") for x in relative_path.parts]
+    parts.append(filename.lower())
+    if any(p in SENT_MAIL for p in parts):
         return "Enviados"
-
     return "Recibidos"
 
+
+# ------------------------------------------------------------------ correo (streaming + puntos de control)
 def is_mbox(p: Path):
     if p.suffix.lower() in (".msf", ".dat", ".json", ".sqlite", ".html", ".txt", ".bak"):
         return False
@@ -781,388 +727,206 @@ def _h(fh, pos, n):
     return d
 
 
-def filter_mbox(src, out_dir, ids_path, start, end,
-                seen, st, save, stop):
+def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
+                start, end, seen: set, st: dict, save, stop):
+    """
+    Lee un buzón mbox y guarda cada correo del mes como un archivo .eml individual.
+    Estructura de salida:
+        out_dir/
+          2026-10-15_Asunto del correo_abc12345.eml
+          2026-10-16_Otro asunto_def67890.eml
 
+    Retoma desde el último checkpoint si se interrumpió.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     ids_path.parent.mkdir(parents=True, exist_ok=True)
 
-    n = 0
-    new_ids = []
-    buf = []
+    n, new_ids, buf = 0, [], []
 
     with open(src, "rb") as fh:
-
         head = hashlib.sha1(fh.read(4096)).hexdigest()
         off = st.get("offset", 0)
-
-        valid = (
-            off > 0
-            and st.get("version") == 2
-            and st.get("head") == head
-            and os.path.getsize(src) >= off
-            and _h(fh, off, 128) == st.get("tail")
-            and (
-                st.get("ids_size", 0) == 0
-                or (
-                    ids_path.exists()
-                    and ids_path.stat().st_size >= st["ids_size"]
-        )
-    )
-)
-
+        valid = (off > 0
+                 and st.get("version") == 2
+                 and st.get("head") == head
+                 and os.path.getsize(src) >= off
+                 and _h(fh, off, 128) == st.get("tail")
+                 and (st.get("ids_size", 0) == 0
+                      or (ids_path.exists() and ids_path.stat().st_size >= st["ids_size"])))
         if valid:
             if ids_path.exists():
                 with open(ids_path, "r+b") as f:
                     f.truncate(st.get("ids_size", 0))
-
-                seen.update(
-                    x.strip()
-                    for x in ids_path.read_text(
-                        encoding="utf-8"
-                    ).splitlines()
-                    if x.strip()
-                )
-
+                seen.update(x.strip() for x in
+                            ids_path.read_text(encoding="utf-8").splitlines() if x.strip())
             n = st.get("count", 0)
-
         else:
             off = 0
             ids_path.unlink(missing_ok=True)
             st.clear()
-            n = 0
 
         def flush_ids():
-
             if new_ids:
-
                 with open(ids_path, "a", encoding="utf-8") as f:
-
                     f.write("\n".join(new_ids) + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-
+                    f.flush(); os.fsync(f.fileno())
                 new_ids.clear()
 
         def checkpoint(boundary):
             flush_ids()
-
-            st.update(
-                version=2,
-                offset=boundary,
-                count=n,
-                head=head,
-                tail=_h(fh, boundary, 128),
-                ids_size=(
-                    ids_path.stat().st_size
-                    if ids_path.exists() else 0
-                )
-            )
-
+            st.update(version=2, offset=boundary, count=n, head=head,
+                      tail=_h(fh, boundary, 128),
+                      ids_size=ids_path.stat().st_size if ids_path.exists() else 0)
             save()
 
         def flush():
-
             nonlocal n
-
             if not buf:
                 return
-
-            # Quitar la línea separadora propia del formato MBOX.
             raw = b"".join(buf[1:])
-
             if not raw:
                 return
-
+            # Parsear con política moderna para acceso correcto a cabeceras
+            message = BytesParser(policy=email_policy.default).parsebytes(raw)
+            # Filtrar mensajes eliminados (bit 0x0008 de Thunderbird)
             try:
-                message = BytesParser(
-                    policy=policy.default
-                ).parsebytes(raw)
-
-                # Respetar el filtro del mes que se respalda.
-                d = _date_of(message, buf[0])
-
-                if d is None or not (start <= d < end):
+                if int((message.get("X-Mozilla-Status", "0") or "0").strip(), 16) & 0x0008:
                     return
-
-                # Evitar mensajes marcados como eliminados.
-                try:
-                    status = int(
-                        message.get(
-                            "X-Mozilla-Status", "0"
-                        ).strip() or "0",
-                        16
-                    )
-
-                    if status & 0x0008:
-                        return
-
-                except (ValueError, AttributeError):
-                    pass
-
-                # Evitar duplicados mediante Message-ID.
-                mid = " ".join(
-                    (message.get("Message-ID") or "").split()
-                )
-
-                if mid and mid in seen:
-                    return
-
-                # Si no hay Message-ID, utilizar huella del contenido.
-                unique_id = mid or hashlib.sha256(raw).hexdigest()
-
-                if unique_id in seen:
-                    return
-
-                filename = get_mail_filename(message, raw)
-                output = out_dir / filename
-
-                # Escritura temporal para evitar EML incompletos.
-                part = output.with_name(output.name + ".part")
-
-                with open(part, "wb") as destination:
-                    generator = BytesGenerator(
-                        destination,
-                        policy=policy.default
-                    )
-
-                    generator.flatten(
-                        message,
-                        unixfrom=False
-                    )
-
-                    destination.flush()
-                    os.fsync(destination.fileno())
-
-                os.replace(part, output)
-
-                seen.add(unique_id)
-                new_ids.append(unique_id)
-                n += 1
-
-            except Exception as e:
-                raise RuntimeError(
-                    f"Error al convertir mensaje de {src}: {e}"
-                ) from e
+            except (ValueError, AttributeError):
+                pass
+            # Filtrar por fecha del mes
+            d = _date_of(message, buf[0])
+            if d is None or not (start <= d < end):
+                return
+            # Deduplicar por Message-ID o huella del contenido
+            mid = " ".join((message.get("Message-ID") or "").split())
+            unique_id = mid or hashlib.sha256(raw).hexdigest()
+            if unique_id in seen:
+                return
+            # Nombre de archivo legible: AAAA-MM-DD_Asunto_huella.eml
+            filename = get_mail_filename(message, raw)
+            output = out_dir / filename
+            part = output.with_name(output.name + ".part")
+            with open(part, "wb") as dst:
+                BytesGenerator(dst, policy=email_policy.default).flatten(message, unixfrom=False)
+                dst.flush(); os.fsync(dst.fileno())
+            os.replace(part, output)
+            seen.add(unique_id)
+            new_ids.append(unique_id)
+            n += 1
 
         try:
-
             fh.seek(off)
-
-            pos = off
-            prev_blank = True
-            last_ck = time.time()
-            message_since_checkpoint = 0
-
-            
+            pos, prev_blank, last_ck, msgs_since_ck = off, True, time.time(), 0
             while True:
-
                 line = fh.readline()
-
                 if not line:
                     break
-
-                # Detectar el inicio de un nuevo correo MBOX.
                 if prev_blank and line.startswith(b"From "):
-
-                    # Procesar el correo anterior.
                     flush()
-
-                    # Contabilizar un mensaje terminado.
-                    messages_since_checkpoint += 1
-
-                    # Guardar progreso cada 15 segundos
-                    # o cada 25 mensajes procesados.
-                    if (
-                        time.time() - last_ck >= CK_SECONDS
-                        or messages_since_checkpoint >= 25
-                    ):
-
+                    msgs_since_ck += 1
+                    if time.time() - last_ck >= CK_SECONDS or msgs_since_ck >= 25:
                         checkpoint(pos)
-
-                        last_ck = time.time()
-                        messages_since_checkpoint = 0
-
+                        last_ck, msgs_since_ck = time.time(), 0
                         if stop():
                             raise Stopped()
-
-                    # Comenzar el siguiente correo.
                     buf = [line]
-
                 else:
                     buf.append(line)
-
-                prev_blank = line.strip() == b""
+                prev_blank = (line.strip() == b"")
                 pos += len(line)
-
-
             flush()
-
             flush_ids()
-
-            st.update(
-                version=2,
-                done=True,
-                count=n,
-                offset=pos,
-                head=head,
-                tail=_h(fh, pos, 128),
-                ids_size=(
-                    ids_path.stat().st_size
-                    if ids_path.exists() else 0
-                )
-            )
-
+            st.update(version=2, done=True, count=n, offset=pos, head=head,
+                      tail=_h(fh, pos, 128),
+                      ids_size=ids_path.stat().st_size if ids_path.exists() else 0)
             save()
-
         except Stopped:
             raise
-
     return n
 
 
+def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
+    """
+    Recorre todos los buzones de una cuenta de Thunderbird y exporta
+    cada correo del mes como archivo .eml individual.
 
-def backup_mail(base, sub, out_base, start, end,
-                prog, tag, log, err, stop):
-
+    Estructura final en out_base:
+        Recibidos/
+          2026-10-15_Newsletter_abc12345.eml
+          ...
+        Enviados/
+          2026-10-16_RE-Propuesta_def67890.eml
+          ...
+    """
     seen_cache = {}
-
-    # Directorio independiente para identificadores de correos EML.
     ids_dir = PROG_DIR / f"{tag}_eml_ids"
 
     def ids_file(key):
-        filename = hashlib.sha256(
-        key.encode("utf-8")
-    ).hexdigest()
+        return ids_dir / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".txt")
 
-        return ids_dir / f"{filename}.txt"
-
-
-def seen_for(account_id):
-
-    if account_id not in seen_cache:
-
-        seen = set()
-
-        prefix = f"EML/{account_id}/"
-
-        for key, state in prog["mail"].items():
-
-            # Solo consultar buzones de esta cuenta.
-            if not key.startswith(prefix):
-                continue
-
-            path = ids_file(key)
-
-            if not path.exists():
-                continue
-
-            # Recuperar únicamente los IDs confirmados
-            # en el último checkpoint.
-            saved_size = state.get("ids_size", 0)
-
-            with open(path, "r+b") as f:
-                f.truncate(saved_size)
-
-            with open(path, "r", encoding="utf-8") as f:
-                seen.update(
-                    line.strip()
-                    for line in f
-                    if line.strip()
-                )
-
-        seen_cache[account_id] = seen
-
-    return seen_cache[account_id]
-
-
-    base = Path(base)
+    def seen_for(account_id):
+        if account_id not in seen_cache:
+            s = set()
+            prefix = f"EML/{account_id}/"
+            for k, v in prog["mail"].items():
+                if not k.startswith(prefix):
+                    continue
+                fp = ids_file(k)
+                if not fp.exists():
+                    continue
+                saved = v.get("ids_size", 0)
+                with open(fp, "r+b") as f:
+                    f.truncate(saved)
+                s.update(x.strip() for x in fp.read_text(encoding="utf-8").splitlines() if x.strip())
+            seen_cache[account_id] = s
+        return seen_cache[account_id]
 
     for root, dirs, files in os.walk(base):
-
-        if stop():
-            raise Stopped()
-
         rel = Path(root).relative_to(base)
-
-        dirs[:] = sorted(
-            d for d in dirs
-            if (
-                d[:-4] if d.lower().endswith(".sbd") else d
-            ).lower() not in SKIP_MAIL
-        )
-
-        if any(
-            x.lower() in SKIP_MAIL
-            for x in rel.parts
-        ):
+        parts = [x[:-4] if x.lower().endswith(".sbd") else x for x in rel.parts]
+        dirs[:] = sorted(d for d in dirs
+                         if (d[:-4] if d.lower().endswith(".sbd") else d).lower() not in SKIP_MAIL)
+        if any(x.lower() in SKIP_MAIL for x in parts):
             continue
-
-        for filename in sorted(files):
-
-            p = Path(root) / filename
-
-            if filename.lower() in SKIP_MAIL or not is_mbox(p):
+        for fname in sorted(files):
+            p = Path(root) / fname
+            if fname.lower() in SKIP_MAIL or not is_mbox(p):
                 continue
-
-            category = get_mail_category(rel, filename)
-
+            category = get_mail_category(rel, fname)       # "Recibidos" o "Enviados"
             account_id = hashlib.sha256(
-                str(base.resolve()).lower().encode("utf-8")
+                str(Path(base).resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
-
             mailbox_id = hashlib.sha256(
                 str(p.resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
-
             key = f"EML/{account_id}/{mailbox_id}"
-
             st = prog["mail"].setdefault(key, {})
-
             if st.get("done"):
                 continue
-
             try:
-
-                if (
-                    not st.get("offset")
-                    and p.stat().st_mtime < start.timestamp()
-                ):
-                    st.update(done=True, count=0, version=2)
-                    save_prog(tag, prog)
-                    continue
-
-                destination = out_base / category
-
-                log(
-                    f"  {category}: {p.name}"
-                    + (
-                        " (retomando)"
-                        if st.get("offset") else ""
-                    )
+                if not st.get("offset") and p.stat().st_mtime < start.timestamp():
+                    st.update(done=True, count=0, version=2); continue
+                resuming = bool(st.get("offset"))
+                log(f"  {category}: {p.name}" + (" (retomando)" if resuming else ""))
+                total_mails_so_far = sum(v.get("count", 0) for v in prog["mail"].values()
+                                         if isinstance(v, dict))
+                report_progress(
+                    cfg, "correos",
+                    f"{category} — buzón {p.name}"
+                    + (f" (retomando desde correo {st.get('count', 0)})" if resuming else ""),
+                    archivos=prog["files"],
+                    correos=total_mails_so_far,
                 )
-
-                count = filter_mbox(
-                    p,
-                    destination,
-                    ids_file(key),
-                    start,
-                    end,
-                    seen_for(account_id),
-                    st,
-                    lambda: save_prog(tag, prog),
-                    stop
-                )
-
+                count = filter_mbox(p, out_base / category, ids_file(key),
+                                    start, end, seen_for(account_id),
+                                    st, lambda: save_prog(tag, prog), stop)
                 if count:
-                    log(f"    {count} correos exportados")
-
+                    log(f"    {count} correos exportados como .eml")
             except Stopped:
                 raise
-
             except Exception as e:
                 err(f"Correo {key}: {e}")
-
     save_prog(tag, prog)
 
 
@@ -1287,6 +1051,8 @@ def send(cfg, tag, log):
             log(f"  {why}"); continue
         dst = Path(dest) / cfg["machine_name"].strip() / tag
         log(f"Enviando a {dst}")
+        report_progress(cfg, "enviando", f"Enviando a PC100…",
+                        archivos=0, correos=0, dest=dest)
         try:
             if shutil.which("robocopy"):
                 # Escribir el log de robocopy en %TEMP% (siempre accesible, sea cual
@@ -1362,7 +1128,16 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
         if res["status"] in ("ok", "error"):
             for d in ([used] if used else destinations(cfg)):
                 if dest_reachable(d)[0]:
-                    write_status(cfg, tag, res, d); break
+                    write_status(cfg, tag, res, d)
+                    # Reportar el estado final antes de borrar el archivo de progreso
+                    report_progress(cfg,
+                                    "listo" if res["status"] == "ok" else "error",
+                                    ("Respaldo completado" if res["status"] == "ok"
+                                     else f"Terminó con {len(res['errors'])} error(es)"),
+                                    archivos=res["files"], correos=res["mails"], dest=d)
+                    time.sleep(5)   # dar tiempo al panel para leer el estado final
+                    clear_progress(cfg, d)
+                    break
         if res["status"] == "ok" and cfg.get("delete_local_after_send"):
             shutil.rmtree(local_dir(cfg, tag), ignore_errors=True)
         log(f"== {tag}: {res['status'].upper()} (archivos={res['files']}, correos={res['mails']}, "
@@ -1650,7 +1425,9 @@ def run_gui():
     V = {k: tk.StringVar(value=cfg.get(k, "")) for k in
          ("machine_name", "destination", "destination_alt", "local_root", "thunderbird", "target_user",
           "net_user", "net_pass")}
-    v_excl = tk.StringVar(value=", ".join(cfg.get("excluded_users", [])))
+    v_excl      = tk.StringVar(value=", ".join(cfg.get("excluded_users", [])))
+    v_skip_dirs = tk.StringVar(value=", ".join(cfg.get("extra_skip_dirs", [])))
+    v_skip_ext  = tk.StringVar(value=", ".join(cfg.get("extra_skip_ext", [])))
     v_del = tk.BooleanVar(value=cfg["delete_local_after_send"])
     v_sys = tk.BooleanVar(value=cfg.get("run_as_system", True))
     py_, pm_ = prev_month()
@@ -1788,6 +1565,37 @@ def run_gui():
           help_="Déjalo vacío salvo que haya más de un usuario y debas precisar cuál, ej. «ULAPC».")
     ttk.Label(c5, text="Usuarios excluidos (coma):", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=4)
     ttk.Entry(c5, textvariable=v_excl).grid(row=2, column=1, sticky="ew", pady=4)
+
+    # ---- exclusiones de archivos ----
+    ttk.Separator(c5, orient="horizontal").grid(row=9, column=0, columnspan=3, sticky="ew", pady=8)
+    ttk.Label(c5, text="🚫  Exclusiones de archivos", style="CardTitle.TLabel"
+              ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+    ttk.Label(c5, text="Carpetas a omitir (coma):", style="Card.TLabel"
+              ).grid(row=11, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Entry(c5, textvariable=v_skip_dirs).grid(row=11, column=1, sticky="ew", pady=4)
+    ttk.Label(c5,
+              text="Ej: Dell Support, Plantillas, OneDrive — se omiten en todas las carpetas de usuario.",
+              style="CardMuted.TLabel").grid(row=12, column=0, columnspan=3, sticky="w")
+
+    ttk.Label(c5, text="Extensiones a omitir (coma):", style="Card.TLabel"
+              ).grid(row=13, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Entry(c5, textvariable=v_skip_ext).grid(row=13, column=1, sticky="ew", pady=4)
+    ttk.Label(c5,
+              text="Ej: .psd, .iso, .zip — se suma a los ya excluidos por defecto "
+                   "(.lnk, .exe, .dll, .tmp, .bat…).",
+              style="CardMuted.TLabel").grid(row=14, column=0, columnspan=3, sticky="w")
+
+    # Botón para ver qué se excluye por defecto
+    def show_defaults():
+        from tkinter import messagebox
+        dirs_txt = "\n".join(sorted(SKIP_DIRS))
+        ext_txt  = "\n".join(sorted(e for e in SKIP_EXT if e.startswith(".")))
+        messagebox.showinfo("Exclusiones por defecto",
+                            f"CARPETAS omitidas siempre:\n{dirs_txt}\n\n"
+                            f"EXTENSIONES omitidas siempre:\n{ext_txt}")
+    ttk.Button(c5, text="Ver exclusiones por defecto", style="Soft.TButton",
+               command=show_defaults).grid(row=15, column=0, columnspan=2, sticky="w", pady=(4, 0))
     field(c5, 3, "Carpeta local temporal (oculta):", "local_root", True)
     field(c5, 5, "Perfil de Thunderbird manual (opcional):", "thunderbird", True)
 
@@ -1849,7 +1657,9 @@ def run_gui():
         c.update({k: v.get().strip() for k, v in V.items()})
         c.update(sources=list(lb.get(0, "end")), delete_local_after_send=v_del.get(),
                  run_as_system=v_sys.get(),
-                 excluded_users=[x.strip() for x in v_excl.get().split(",") if x.strip()])
+                 excluded_users=[x.strip() for x in v_excl.get().split(",") if x.strip()],
+                 extra_skip_dirs=[x.strip().lower() for x in v_skip_dirs.get().split(",") if x.strip()],
+                 extra_skip_ext=[x.strip().lower() for x in v_skip_ext.get().split(",") if x.strip()])
         return c
 
     def refresh_users():
@@ -1955,40 +1765,6 @@ def run_gui():
 
     refresh_state(); refresh_users(); pump()
     root.mainloop()
-
-
-def diagnostico_thunderbird():
-    users = get_user_profiles()
-
-    for user in users:
-        profiles = find_thunderbird_profiles(user)
-
-        for profile in profiles:
-            print("\nPERFIL:", profile)
-
-            accounts = get_thunderbird_accounts(profile)
-
-            for account in accounts:
-                print("CUENTA:", account["label"])
-                print("TIPO:", account["type"])
-                print("ALMACEN:", account["directory"])
-                print("EXISTE:", account["directory"].is_dir())
-
-            prefs = read_thunderbird_prefs(profile)
-
-            print("\nPREFERENCIAS DE CARPETAS:")
-
-            for key, value in prefs.items():
-                if any(x in key.lower() for x in (
-                    "fcc_folder",
-                    "sent_folder",
-                    "trash_folder",
-                    "draft_folder",
-                    "imapserver",
-                    "directory"
-                )):
-                    print(key, "=", value)
-
 def main():
     a = sys.argv[1:]
     if "--instalar" in a:
@@ -1999,8 +1775,6 @@ def main():
         run_auto("auto")
     elif "--vigilar" in a:
         run_watch()
-    elif "--diagnostico-tb" in a:
-        diagnostico_thunderbird()    
     else:
         run_gui()
 
