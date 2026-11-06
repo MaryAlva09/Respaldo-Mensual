@@ -703,7 +703,7 @@ def thunderbird_account_labels(profile_dir: Path) -> dict:
         return {}
 
     prefs = {}
-    pref_re = re.compile(r'user_pref\("(.*?)",\s*("(?:\\\\.|[^"\\\\])*"|true|false|-?\\d+)\);')
+    pref_re = re.compile(r'user_pref\("(.*?)",\s*("(?:\\.|[^"\\])*"|true|false|-?\d+)\);')
     try:
         for key, value in pref_re.findall(prefs_path.read_text(encoding="utf-8", errors="replace")):
             try:
