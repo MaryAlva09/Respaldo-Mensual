@@ -646,8 +646,8 @@ def collect(cfg, y, m, prog, log, stop):
                         tag,
                         log,
                         err,
-                        stop
-                    )
+                    stop
+                )
         prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
         log(f"  correos respaldados: {prog['mails']}")
     else:
