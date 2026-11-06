@@ -926,8 +926,12 @@ def backup_mail(cfg, base, sub, out_base, start, end,
 
             category = get_mail_category(rel, fname)
 
+            account_key = rel.parts[0] if rel.parts else "Cuenta_sin_identificar"
+            account_folder = clean_mail_filename(account_key, max_length=80)
+            account_path = Path(base) / account_key
+
             account_id = hashlib.sha256(
-                str(Path(base).resolve()).lower().encode("utf-8")
+                str(account_path.resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
 
             mailbox_id = hashlib.sha256(
@@ -951,7 +955,7 @@ def backup_mail(cfg, base, sub, out_base, start, end,
                 resuming = bool(st.get("offset"))
 
                 log(
-                    f"  {category}: {p.name}"
+                    f"  Cuenta {account_folder} — {category}: {p.name}"
                     + (" (retomando)" if resuming else "")
                 )
 
@@ -976,7 +980,7 @@ def backup_mail(cfg, base, sub, out_base, start, end,
 
                 count = filter_mbox(
                     p,
-                    out_base / category,
+                    out_base / account_folder / category,
                     ids_file(key),
                     start,
                     end,

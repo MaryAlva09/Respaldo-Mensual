@@ -36,6 +36,7 @@ CFG_FILE = CFG_DIR / "config.json"
 
 DEFAULTS = {
     "destino_root": "",
+    "admin_user": "admin",
     "password_hash": hashlib.sha256("admin".encode()).hexdigest(),
     "readonly_hash": "",   # contraseña del usuario de solo lectura (vacío = deshabilitado)
     "secret_key": secrets.token_hex(16),
@@ -234,6 +235,7 @@ LOGIN_HTML = """
     <p style="color:var(--muted);font-size:14px">Acceso restringido al encargado del respaldo.</p>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     <form method="post">
+      <input type="text" name="username" placeholder="Usuario" autofocus>
       <input type="password" name="password" placeholder="Contraseña" autofocus>
       <button class="btn btn-primary" style="width:100%" type="submit">Entrar</button>
     </form>
@@ -536,9 +538,10 @@ def login():
         return redirect(url_for("setup"))
     error = None
     if request.method == "POST":
+        username = request.form.get("username", "").strip()
         pw = request.form.get("password", "")
         ph = hashlib.sha256(pw.encode()).hexdigest()
-        if ph == CFG["password_hash"]:
+        if username == CFG.get("admin_user", "admin") and ph == CFG["password_hash"]:
             session["ok"] = True
             session.pop("readonly", None)
             return redirect(url_for("dashboard"))
@@ -666,6 +669,9 @@ def config_view():
         destino = request.form.get("destino_root", "").strip()
         pw = request.form.get("password", "").strip()
         pw_ro = request.form.get("password_ro", "").strip()
+        admin_user = request.form.get("admin_user", "").strip()
+        if admin_user:
+            CFG["admin_user"] = admin_user
         if destino:
             CFG["destino_root"] = destino
         if pw:
@@ -688,6 +694,11 @@ def config_view():
       <label style="font-size:13px;color:var(--muted)">Carpeta local de los respaldos:</label>
       <input type="text" name="destino_root" value="{CFG.get('destino_root','')}"
              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
+
+       <label style="font-size:13px;color:var(--muted)">Usuario administrador:</label>
+       <input type="text" name="admin_user" value="{CFG.get('admin_user', 'admin')}"
+              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px"> 
+
       <label style="font-size:13px;color:var(--muted)">Nueva contraseña del administrador (vacío = no cambiar):</label>
       <input type="password" name="password"
              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
@@ -751,26 +762,29 @@ def _list_emls(maquina, mes):
     for carpeta_user in sorted(root.iterdir()):
         if not carpeta_user.is_dir():
             continue
-        for categoria in ("Recibidos", "Enviados"):
-            cat_dir = carpeta_user / categoria
-            if not cat_dir.is_dir():
-                continue
-            for eml in sorted(cat_dir.glob("*.eml"), reverse=True):
-                try:
-                    raw = eml.read_bytes()
-                    msg = _email_mod.message_from_bytes(raw)
-                    result.append({
-                        "carpeta": categoria,
-                        "cuenta": carpeta_user.name,
-                        "archivo": eml.name,
-                        "de": _parse_header(msg.get("From", "")),
-                        "para": _parse_header(msg.get("To", "")),
-                        "asunto": _parse_header(msg.get("Subject", "(sin asunto)")),
-                        "fecha": _parse_header(msg.get("Date", "")),
-                        "size": eml.stat().st_size,
-                    })
-                except Exception:
-                    pass
+        for sub in ("ImapMail", "Mail"):
+            for categoria in ("Recibidos", "Enviados"):
+                cat_dir = carpeta_user / sub / categoria
+                if not cat_dir.is_dir():
+                    continue
+
+        for eml in sorted(cat_dir.glob("*.eml"), reverse=True):
+            try:
+                raw = eml.read_bytes()
+                msg = _email_mod.message_from_bytes(raw)
+                result.append({
+                    "carpeta": categoria,
+                    "cuenta": carpeta_user.name,
+                    "sub": sub,
+                    "archivo": eml.name,
+                    "de": _parse_header(msg.get("From", "")),
+                    "para": _parse_header(msg.get("To", "")),
+                    "asunto": _parse_header(msg.get("Subject", "(sin asunto)")),
+                    "fecha": _parse_header(msg.get("Date", "")),
+                    "size": eml.stat().st_size,
+                })
+            except Exception:
+                pass
     return result
 
 
@@ -840,7 +854,7 @@ def correos_lista(maquina, mes):
     filas = ""
     for e in emls:
         url = url_for("correos_ver", maquina=maquina, mes=mes,
-                      cuenta=e["cuenta"], carpeta=e["carpeta"], archivo=e["archivo"])
+                      cuenta=e["cuenta"],sub=e["sub"], carpeta=e["carpeta"], archivo=e["archivo"])
         badge = ("#16A34A" if e["carpeta"] == "Recibidos" else "#2563EB")
         filas += (
             f'<tr onclick="location.href=\'{url}\'" style="cursor:pointer">'
@@ -877,12 +891,12 @@ tr:hover td{{background:#F0F7FF}}
 
 
 @app.route("/correos/<maquina>/<mes>/<cuenta>/<carpeta>/<archivo>")
-def correos_ver(maquina, mes, cuenta, carpeta, archivo):
+def correos_ver(maquina, mes, cuenta, sub, carpeta, archivo):
     if not logueado():
         return redirect(url_for("login"))
     # Validar que el archivo esté dentro de la ruta esperada (sin path traversal)
     root = _correos_root(maquina, mes)
-    eml_path = (root / cuenta / carpeta / archivo).resolve()
+    eml_path = (root / cuenta / sub / carpeta / archivo).resolve()
     if not str(eml_path).startswith(str(root.resolve())):
         return "Ruta no permitida", 403
     if not eml_path.exists() or eml_path.suffix.lower() != ".eml":
