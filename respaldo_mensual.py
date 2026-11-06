@@ -635,8 +635,19 @@ def collect(cfg, y, m, prog, log, stop):
             for sub in ("ImapMail", "Mail"):
                 base = Path(tb) / sub
                 if base.is_dir():
-                    backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
-                                start, end, prog, tag, log, err, stop)
+                    backup_mail(
+                        cfg,
+                        base,
+                        f"{ulabel}:{sub}",
+                        dest_root / "Correos" / ulabel / sub,
+                        start,
+                        end,
+                        prog,
+                        tag,
+                        log,
+                        err,
+                        stop
+                    )
         prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
         log(f"  correos respaldados: {prog['mails']}")
     else:
@@ -846,88 +857,146 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
     return n
 
 
-def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
+
+def backup_mail(cfg, base, sub, out_base, start, end,
+                prog, tag, log, err, stop):
     """
     Recorre todos los buzones de una cuenta de Thunderbird y exporta
     cada correo del mes como archivo .eml individual.
-
-    Estructura final en out_base:
-        Recibidos/
-          2026-10-15_Newsletter_abc12345.eml
-          ...
-        Enviados/
-          2026-10-16_RE-Propuesta_def67890.eml
-          ...
     """
     seen_cache = {}
     ids_dir = PROG_DIR / f"{tag}_eml_ids"
 
     def ids_file(key):
-        return ids_dir / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".txt")
+        return ids_dir / (
+            hashlib.sha256(key.encode("utf-8")).hexdigest() + ".txt"
+        )
 
     def seen_for(account_id):
         if account_id not in seen_cache:
             s = set()
             prefix = f"EML/{account_id}/"
+
             for k, v in prog["mail"].items():
                 if not k.startswith(prefix):
                     continue
+
                 fp = ids_file(k)
                 if not fp.exists():
                     continue
+
                 saved = v.get("ids_size", 0)
+
                 with open(fp, "r+b") as f:
                     f.truncate(saved)
-                s.update(x.strip() for x in fp.read_text(encoding="utf-8").splitlines() if x.strip())
+
+                s.update(
+                    x.strip()
+                    for x in fp.read_text(encoding="utf-8").splitlines()
+                    if x.strip()
+                )
+
             seen_cache[account_id] = s
+
         return seen_cache[account_id]
 
     for root, dirs, files in os.walk(base):
         rel = Path(root).relative_to(base)
-        parts = [x[:-4] if x.lower().endswith(".sbd") else x for x in rel.parts]
-        dirs[:] = sorted(d for d in dirs
-                         if (d[:-4] if d.lower().endswith(".sbd") else d).lower() not in SKIP_MAIL)
+
+        parts = [
+            x[:-4] if x.lower().endswith(".sbd") else x
+            for x in rel.parts
+        ]
+
+        dirs[:] = sorted(
+            d for d in dirs
+            if (
+                d[:-4] if d.lower().endswith(".sbd") else d
+            ).lower() not in SKIP_MAIL
+        )
+
         if any(x.lower() in SKIP_MAIL for x in parts):
             continue
+
         for fname in sorted(files):
             p = Path(root) / fname
+
             if fname.lower() in SKIP_MAIL or not is_mbox(p):
                 continue
-            category = get_mail_category(rel, fname)       # "Recibidos" o "Enviados"
+
+            category = get_mail_category(rel, fname)
+
             account_id = hashlib.sha256(
                 str(Path(base).resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
+
             mailbox_id = hashlib.sha256(
                 str(p.resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
+
             key = f"EML/{account_id}/{mailbox_id}"
             st = prog["mail"].setdefault(key, {})
+
             if st.get("done"):
                 continue
+
             try:
-                if not st.get("offset") and p.stat().st_mtime < start.timestamp():
-                    st.update(done=True, count=0, version=2); continue
+                if (
+                    not st.get("offset")
+                    and p.stat().st_mtime < start.timestamp()
+                ):
+                    st.update(done=True, count=0, version=2)
+                    continue
+
                 resuming = bool(st.get("offset"))
-                log(f"  {category}: {p.name}" + (" (retomando)" if resuming else ""))
-                total_mails_so_far = sum(v.get("count", 0) for v in prog["mail"].values()
-                                         if isinstance(v, dict))
+
+                log(
+                    f"  {category}: {p.name}"
+                    + (" (retomando)" if resuming else "")
+                )
+
+                total_mails_so_far = sum(
+                    v.get("count", 0)
+                    for v in prog["mail"].values()
+                    if isinstance(v, dict)
+                )
+
+                # cfg ahora está disponible como parámetro.
                 report_progress(
-                    cfg, "correos",
+                    cfg,
+                    "correos",
                     f"{category} — buzón {p.name}"
-                    + (f" (retomando desde correo {st.get('count', 0)})" if resuming else ""),
+                    + (
+                        f" (retomando desde correo {st.get('count', 0)})"
+                        if resuming else ""
+                    ),
                     archivos=prog["files"],
                     correos=total_mails_so_far,
                 )
-                count = filter_mbox(p, out_base / category, ids_file(key),
-                                    start, end, seen_for(account_id),
-                                    st, lambda: save_prog(tag, prog), stop)
+
+                count = filter_mbox(
+                    p,
+                    out_base / category,
+                    ids_file(key),
+                    start,
+                    end,
+                    seen_for(account_id),
+                    st,
+                    lambda: save_prog(tag, prog),
+                    stop
+                )
+
                 if count:
                     log(f"    {count} correos exportados como .eml")
+
             except Stopped:
                 raise
+
             except Exception as e:
                 err(f"Correo {key}: {e}")
+
     save_prog(tag, prog)
+
 
 
 # ------------------------------------------------------------------ Credenciales de red para SYSTEM
