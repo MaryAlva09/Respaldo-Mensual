@@ -35,11 +35,10 @@ else:
 CFG_FILE = CFG_DIR / "config.json"
 
 DEFAULTS = {
-    "destino_root": "",                      # ruta LOCAL en PC100, ej. D:\Respaldos
+    "destino_root": "",
     "password_hash": hashlib.sha256("admin".encode()).hexdigest(),
+    "readonly_hash": "",   # contraseña del usuario de solo lectura (vacío = deshabilitado)
     "secret_key": secrets.token_hex(16),
-    # Lista de máquinas registradas — fuente de verdad local, en el disco de PC100.
-    # Nunca se pierde aunque la carpeta de red no esté disponible.
     "maquinas": [],
 }
 
@@ -271,130 +270,220 @@ DASH_HTML = """
 .btn-quitar:hover{color:var(--red)}
 .agregar-box{display:flex;gap:8px;margin-bottom:14px}
 .agregar-box input{flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:14px}
+.prog-bar{height:4px;background:#E5EDFB;border-radius:99px;margin:6px 0}
+.prog-bar-inner{height:4px;border-radius:99px;background:var(--primary);animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.reagendado{background:#FEF3C7;border-radius:6px;padding:4px 8px;font-size:12px;
+            color:#92400E;margin-top:6px}
+.readonly-banner{background:#EFF6FF;border:1px solid #BFDBFE;color:#1D4ED8;
+                 padding:8px 16px;border-radius:8px;margin-bottom:12px;font-size:13px}
+.btn:disabled,.btn-primary:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
 </style></head>
 <body>
 <header>
-  <h1>\U0001f5c2\ufe0f Respaldo Mensual \u2014 Panel del administrador</h1>
+  <h1>&#x1f5c2;&#xfe0f; Respaldo Mensual &mdash; Panel del administrador</h1>
   <div>
-    <a class="logout" href="{{ url_for('config_view') }}" style="margin-right:16px">\u2699\ufe0f Configuraci\u00f3n</a>
-    <a class="logout" href="{{ url_for('logout') }}">Cerrar sesi\u00f3n</a>
+    {% if es_admin %}
+    <a class="logout" href="{{ url_for('config_view') }}" style="margin-right:16px">&#x2699;&#xfe0f; Configuraci&oacute;n</a>
+    {% endif %}
+    <a class="logout" href="{{ url_for('logout') }}">Cerrar sesi&oacute;n</a>
   </div>
 </header>
 <div class="wrap">
+  {% if not es_admin %}
+  <div class="readonly-banner">&#x1f441; Modo solo lectura &mdash; puedes ver el estado pero no iniciar respaldos.</div>
+  {% endif %}
   <div class="toolbar">
     <label>Mes: <input type="month" id="mes" value="{{ mes }}"></label>
-    <input type="text" id="buscar" placeholder="\U0001f50d Buscar m\u00e1quina\u2026">
+    <input type="text" id="buscar" placeholder="&#x1f50d; Buscar m&aacute;quina&hellip;">
     <button class="btn" onclick="cargar()">&#x21bb; Actualizar</button>
+    {% if es_admin %}
     <a class="btn" href="{{ url_for('esperadas_view') }}">&#x1f4cb; Editar lista completa</a>
+    <button class="btn" onclick="verReporte()">&#x1f4c4; Reporte mensual</button>
+    {% endif %}
   </div>
+  {% if es_admin %}
   <div class="agregar-box">
-    <input type="text" id="nueva-maquina" placeholder="Agregar m\u00e1quina, ej. LAPC 46">
+    <input type="text" id="nueva-maquina" placeholder="Agregar m&aacute;quina, ej. LAPC 46">
     <button class="btn btn-primary" onclick="agregarMaquina()">+ Agregar</button>
   </div>
+  {% endif %}
   <div class="aviso-red" id="aviso-red">
-    &#x26a0; La carpeta de respaldos no est\u00e1 disponible en este momento.
-    Las m\u00e1quinas registradas siguen apareciendo pero su estado puede estar desactualizado.
+    &#x26a0; La carpeta de respaldos no est&aacute; disponible ahora.
+    Las m&aacute;quinas registradas siguen apareciendo con su &uacute;ltimo estado conocido.
   </div>
-  <div class="summary" id="resumen">Cargando\u2026</div>
+  <div class="summary" id="resumen">Cargando&hellip;</div>
   <div class="grid" id="grid"></div>
 </div>
 <div class="toast" id="toast"></div>
 <script>
+var ES_ADMIN = {{ 'true' if es_admin else 'false' }};
+
 function toast(msg, color){
   var t = document.getElementById('toast');
-  t.textContent = msg;
-  t.style.background = color || '#1F2937';
+  t.textContent = msg; t.style.background = color || '#1F2937';
   t.classList.add('show');
-  setTimeout(function(){ t.classList.remove('show'); }, 3000);
+  setTimeout(function(){ t.classList.remove('show'); }, 3500);
 }
+
 function agregarMaquina(){
   var nombre = document.getElementById('nueva-maquina').value.trim();
-  if(!nombre){ toast('Escribe el nombre de la m\u00e1quina primero.', '#DC2626'); return; }
-  fetch('/api/maquinas', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({nombre: nombre})
-  }).then(function(r){ return r.json(); }).then(function(d){
-    if(d.ok){
-      document.getElementById('nueva-maquina').value = '';
-      toast('M\u00e1quina "' + nombre + '" agregada.', '#16A34A');
-      cargar();
-    } else {
-      toast('No se pudo agregar.', '#DC2626');
-    }
+  if(!nombre){ toast('Escribe el nombre de la m\u00e1quina primero.','#DC2626'); return; }
+  fetch('/api/maquinas',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({nombre:nombre})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(d.ok){ document.getElementById('nueva-maquina').value='';
+              toast('M\u00e1quina "'+nombre+'" agregada.','#16A34A'); cargar(); }
+    else toast('Error: '+(d.error||'no se pudo agregar.'),'#DC2626');
   });
 }
+
 function quitarMaquina(nombre){
-  if(!confirm('\u00bfQuitar "' + nombre + '" de la lista? No se borran sus archivos de respaldo.')){ return; }
-  fetch('/api/maquinas', {
-    method:'DELETE', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({nombre: nombre})
-  }).then(function(r){ return r.json(); }).then(function(d){
-    if(d.ok){ toast('M\u00e1quina eliminada de la lista.', '#D97706'); cargar(); }
-  });
+  if(!confirm('\u00bfQuitar "'+nombre+'" de la lista? No se borran sus archivos.')){ return; }
+  fetch('/api/maquinas',{method:'DELETE',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({nombre:nombre})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){ if(d.ok){ toast('Quitada.','#D97706'); cargar(); }});
 }
+
 function respaldarAhora(nombre){
   var mes = document.getElementById('mes').value;
-  fetch('/api/respaldar/' + encodeURIComponent(nombre), {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mes: mes})
-  }).then(function(r){ return r.json(); }).then(function(d){
-    toast(d.ok ? 'Solicitud enviada. Se ejecutar\u00e1 en los pr\u00f3ximos minutos.' : 'Error: ' + (d.error || ''), d.ok ? '#16A34A' : '#DC2626');
+  fetch('/api/respaldar/'+encodeURIComponent(nombre),{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({mes:mes})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    toast(d.ok ? 'Solicitud enviada. Se ejecutar\u00e1 en los pr\u00f3ximos minutos.' : 'Error: '+(d.error||''),
+          d.ok ? '#16A34A' : '#DC2626');
   });
 }
+
+function verReporte(){
+  var mes = document.getElementById('mes').value;
+  window.open('/api/reporte/'+mes,'_blank');
+}
+
+function etapaTexto(e){
+  if(e==='archivos')     return '&#x1F4C2; Copiando archivos\u2026';
+  if(e==='correos')      return '&#x1F4E7; Respaldando correos\u2026';
+  if(e==='enviando')     return '&#x1F4E4; Enviando a PC100\u2026';
+  if(e==='listo')        return '\u2714 Terminado';
+  if(e==='error')        return '\u26a0 Termin\u00f3 con errores';
+  if(e==='interrumpido') return '\u23f8 Interrumpido';
+  return e;
+}
+
 function badgeTexto(e){
   if(e==='ok')    return '\u2714 Respaldada';
   if(e==='error') return '\u26a0 Con errores';
   return '\u2716 Sin respaldo';
 }
+
 function cargar(){
   var mes = document.getElementById('mes').value;
   var q   = document.getElementById('buscar').value.toLowerCase();
-  fetch('/api/estado?mes=' + mes)
-    .then(function(r){ return r.json(); })
-    .then(function(resp){
-      var lista  = resp.maquinas || [];
-      var red_ok = resp.red_ok !== false;
-      document.getElementById('aviso-red').style.display = red_ok ? 'none' : 'block';
-      var grid = document.getElementById('grid');
-      grid.innerHTML = '';
-      var ok = 0, total = lista.length;
-      lista.forEach(function(m){
-        if(m.estado==='ok') ok++;
-        if(q && m.maquina.toLowerCase().indexOf(q)===-1) return;
-        var div = document.createElement('div');
-        div.className = 'card ' + m.estado;
-        var errHtml = '';
-        if(m.errores && m.errores.length){
-          errHtml = '<div class="errores">' + m.errores.slice(0,5).join('<br>') + '</div>';
-        }
-        div.innerHTML =
-          '<button class="btn-quitar" title="Quitar de la lista">\u2715</button>' +
-          '<span class="badge ' + m.estado + '">' + badgeTexto(m.estado) + '</span>' +
-          '<h3>' + m.maquina + '</h3>' +
-          '<div class="meta">\u00daltima vez: ' + (m.cuando||'\u2014') + '</div>' +
-          '<div class="meta">Archivos: ' + (m.archivos==null?'\u2014':m.archivos) + ' &nbsp; Correos: ' + (m.correos==null?'\u2014':m.correos) + '</div>' +
-          errHtml +
-          '<div class="acciones">' +
-          '<button class="btn btn-primary">&#x25b6; Respaldar ahora</button>' +
-          '<a class="btn" href="/correos/' + encodeURIComponent(m.maquina) + '/' + mes + '">&#x1f4e7; Ver correos</a>' +
-          '</div>';
-        var nombre = m.maquina;
-        div.querySelector('.btn-quitar').onclick   = function(){ quitarMaquina(nombre); };
-        div.querySelector('.btn-primary').onclick  = function(){ respaldarAhora(nombre); };
-        grid.appendChild(div);
-      });
-      document.getElementById('resumen').textContent = ok + ' de ' + total + ' m\u00e1quinas respaldadas en ' + mes + '.';
-    })
-    .catch(function(err){
-      document.getElementById('aviso-red').style.display = 'block';
-      document.getElementById('resumen').textContent = 'No se pudo conectar. Recarga la página.';
+  fetch('/api/estado?mes='+mes)
+  .then(function(r){ return r.json(); })
+  .then(function(resp){
+    var lista  = resp.maquinas || [];
+    var red_ok = resp.red_ok !== false;
+    document.getElementById('aviso-red').style.display = red_ok ? 'none' : 'block';
+    var grid = document.getElementById('grid');
+    grid.innerHTML = '';
+    var ok=0, enProceso=0, total=lista.length;
+    lista.forEach(function(m){
+      if(m.estado==='ok') ok++;
+      if(q && m.maquina.toLowerCase().indexOf(q)===-1) return;
+      var div = document.createElement('div');
+      div.className = 'card '+m.estado;
+
+      // Progreso en tiempo real
+      var progHtml = '';
+      var enCurso = false;
+      if(m.progreso){
+        enCurso = true; enProceso++;
+        var etapa = m.progreso.etapa || '';
+        progHtml =
+          '<div class="prog-bar"><div class="prog-bar-inner"></div></div>'+
+          '<div style="font-size:12px;color:#2563EB">'+etapaTexto(etapa)+
+          ' &nbsp;'+escHtml(m.progreso.detalle||'')+
+          ' &nbsp;<span style="color:#6B7280">arch='+m.progreso.archivos+
+          ' corr='+m.progreso.correos+'</span></div>';
+      }
+
+      // Reagendado
+      var reagHtml = '';
+      if(m.reagendado){
+        var mot = m.reagendado.motivo==='reagendado_por_error' ? 'Reagendado por error' : 'Reagendado (sin respaldo)';
+        var errs = (m.reagendado.errores||[]).slice(0,2).join('; ');
+        reagHtml = '<div class="reagendado">&#x1f504; '+escHtml(mot)+(errs?' &mdash; '+escHtml(errs):'')+'</div>';
+      }
+
+      var errHtml = '';
+      if(m.errores && m.errores.length){
+        errHtml = '<div class="errores">'+m.errores.slice(0,3).map(escHtml).join('<br>')+'</div>';
+      }
+
+      var archivosTxt = (m.archivos==null) ? '-' : m.archivos;
+      var correosTxt  = (m.correos==null)  ? '-' : m.correos;
+
+      // Botón respaldar: deshabilitado si ya respaldada o en curso
+      var yaBien = m.estado==='ok';
+      var btnTxt = yaBien ? '\u2714 Ya respaldada' : (enCurso ? '\u23f3 En proceso\u2026' : '&#x25b6; Respaldar ahora');
+      var btnDis = (!ES_ADMIN || yaBien || enCurso) ? 'disabled' : '';
+      var corrLink = '/correos/'+encodeURIComponent(m.maquina)+'/'+mes;
+
+      div.innerHTML =
+        (ES_ADMIN ? '<button class="btn-quitar" title="Quitar">\u00d7</button>' : '')+
+        '<span class="badge '+m.estado+'">'+badgeTexto(m.estado)+'</span>'+
+        '<h3>'+escHtml(m.maquina)+'</h3>'+
+        '<div class="meta">\u00daltima vez: '+(m.cuando||'\u2014')+'</div>'+
+        '<div class="meta">Archivos: '+archivosTxt+' &nbsp; Correos: '+correosTxt+'</div>'+
+        errHtml + reagHtml + progHtml +
+        '<div class="acciones">'+
+        '<button class="btn btn-primary" '+btnDis+'>'+btnTxt+'</button>'+
+        '<a class="btn" href="'+corrLink+'">&#x1f4e7; Ver correos</a>'+
+        '</div>';
+
+      var nombre = m.maquina;
+      if(ES_ADMIN){
+        var bq = div.querySelector('.btn-quitar');
+        if(bq) bq.onclick = function(){ quitarMaquina(nombre); };
+      }
+      var bp = div.querySelector('.btn-primary');
+      if(bp && !bp.disabled) bp.onclick = function(){ respaldarAhora(nombre); };
+
+      grid.appendChild(div);
     });
+
+    var txt = ok+' de '+total+' m\u00e1quinas respaldadas en '+mes+'.';
+    if(enProceso) txt += '  &#x23f3; '+enProceso+' respaldando ahora.';
+    document.getElementById('resumen').innerHTML = txt;
+
+    // Si hay máquinas en proceso, refrescar más rápido
+    if(enProceso){
+      clearTimeout(window._timer);
+      window._timer = setTimeout(cargar, 8000);
+    }
+  })
+  .catch(function(){
+    document.getElementById('aviso-red').style.display='block';
+    document.getElementById('resumen').textContent='No se pudo conectar. Recarga la p\u00e1gina.';
+  });
 }
+
+function escHtml(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 document.getElementById('buscar').addEventListener('input', cargar);
 document.getElementById('mes').addEventListener('change', cargar);
-document.getElementById('nueva-maquina').addEventListener('keydown', function(e){ if(e.key==='Enter') agregarMaquina(); });
+{% if es_admin %}
+document.getElementById('nueva-maquina').addEventListener('keydown',
+  function(e){ if(e.key==='Enter') agregarMaquina(); });
+{% endif %}
 cargar();
-setInterval(cargar, 30000);
+window._timer = setInterval(cargar, 30000);
 </script>
 </body></html>
 """
@@ -419,6 +508,15 @@ def logueado():
     return session.get("ok") is True
 
 
+def solo_lectura():
+    """El usuario de solo lectura puede ver el estado pero no respaldar ni modificar."""
+    return session.get("readonly") is True
+
+
+def puede_ver():
+    return logueado() or solo_lectura()
+
+
 
 @app.route("/api/diagnostico")
 def api_diagnostico():
@@ -439,8 +537,15 @@ def login():
     error = None
     if request.method == "POST":
         pw = request.form.get("password", "")
-        if hashlib.sha256(pw.encode()).hexdigest() == CFG["password_hash"]:
+        ph = hashlib.sha256(pw.encode()).hexdigest()
+        if ph == CFG["password_hash"]:
             session["ok"] = True
+            session.pop("readonly", None)
+            return redirect(url_for("dashboard"))
+        ro = CFG.get("readonly_hash", "")
+        if ro and ph == ro:
+            session["readonly"] = True
+            session.pop("ok", None)
             return redirect(url_for("dashboard"))
         error = "Contraseña incorrecta."
     return render_template_string(LOGIN_HTML, css=Markup(BASE_CSS), error=error)
@@ -474,24 +579,39 @@ def logout():
 def dashboard():
     if not CFG.get("destino_root"):
         return redirect(url_for("setup"))
-    if not logueado():
+    if not puede_ver():
         return redirect(url_for("login"))
-    return render_template_string(DASH_HTML, css=Markup(BASE_CSS), mes=prev_month_str())
+    es_admin = logueado()
+    return render_template_string(DASH_HTML, css=Markup(BASE_CSS),
+                                   mes=prev_month_str(), es_admin=es_admin)
 
 
 @app.route("/api/estado")
 def api_estado():
-    if not logueado():
+    if not puede_ver():
         return jsonify({"error": "no autorizado", "maquinas": [], "red_ok": False}), 401
     tag = request.args.get("mes", prev_month_str())
     maquinas, red_ok = leer_estado(tag)
-    return jsonify({"maquinas": maquinas, "red_ok": red_ok})
+    # Enriquecer con progreso en tiempo real si está disponible
+    progreso = _leer_progreso()
+    for m in maquinas:
+        nm = m["maquina"]
+        if nm in progreso:
+            m["progreso"] = progreso[nm]
+    # Enriquecer con info de reagendado
+    reagendados = _leer_reagendados()
+    for m in maquinas:
+        nm = m["maquina"]
+        if nm in reagendados:
+            m["reagendado"] = reagendados[nm]
+    return jsonify({"maquinas": maquinas, "red_ok": red_ok,
+                    "es_admin": logueado()})
 
 
 @app.route("/api/respaldar/<maquina>", methods=["POST"])
 def api_respaldar(maquina):
-    if not logueado():
-        return jsonify({"ok": False}), 401
+    if not logueado():   # solo lectura NO puede pedir respaldos
+        return jsonify({"ok": False, "error": "Solo el administrador puede pedir respaldos"}), 403
     mes = (request.get_json(silent=True) or {}).get("mes", prev_month_str())
     try:
         rf = solicitudes_dir() / f"{maquina.strip()}.json"
@@ -508,7 +628,7 @@ def api_respaldar(maquina):
 def api_maquinas():
     """API para agregar o quitar máquinas individuales desde el dashboard."""
     if not logueado():
-        return jsonify({"ok": False}), 401
+        return jsonify({"ok": False}), 403
     if request.method == "GET":
         return jsonify({"maquinas": get_maquinas()})
     data = request.get_json(silent=True) or {}
@@ -516,9 +636,13 @@ def api_maquinas():
     if not nombre:
         return jsonify({"ok": False, "error": "nombre vacío"}), 400
     if request.method == "POST":
+        # Verificar duplicados (insensible a mayúsculas)
+        existentes = [m.lower() for m in get_maquinas()]
+        if nombre.lower() in existentes:
+            return jsonify({"ok": False, "error": f"Ya existe una máquina llamada '{nombre}'"}), 409
         agregar_maquina(nombre)
     elif request.method == "DELETE":
-        lista = [m for m in get_maquinas() if m != nombre]
+        lista = [m for m in get_maquinas() if m.lower() != nombre.lower()]
         set_maquinas(lista)
     return jsonify({"ok": True, "maquinas": get_maquinas()})
 
@@ -541,13 +665,56 @@ def config_view():
     if request.method == "POST":
         destino = request.form.get("destino_root", "").strip()
         pw = request.form.get("password", "").strip()
+        pw_ro = request.form.get("password_ro", "").strip()
         if destino:
             CFG["destino_root"] = destino
         if pw:
             CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
+        if pw_ro:
+            CFG["readonly_hash"] = hashlib.sha256(pw_ro.encode()).hexdigest()
+        elif request.form.get("disable_ro"):
+            CFG["readonly_hash"] = ""
         save_cfg(CFG)
         return redirect(url_for("dashboard"))
-    return render_template_string(SETUP_HTML, css=Markup(BASE_CSS), error=error, destino_root=CFG.get("destino_root", ""))
+    # Plantilla extendida con campo para usuario de solo lectura
+    cfg_html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
+<title>Configuración</title><style>{BASE_CSS}</style></head><body>
+<header><h1 style="margin:0">⚙️ Configuración del panel</h1>
+<a class="logout" href="{url_for('dashboard')}">← Volver</a></header>
+<div class="wrap">
+  <div style="background:#fff;border:1px solid #D7E2F2;border-radius:12px;padding:24px;max-width:500px">
+    {'<p style="color:var(--red)">' + error + '</p>' if error else ''}
+    <form method="post">
+      <label style="font-size:13px;color:var(--muted)">Carpeta local de los respaldos:</label>
+      <input type="text" name="destino_root" value="{CFG.get('destino_root','')}"
+             style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
+      <label style="font-size:13px;color:var(--muted)">Nueva contraseña del administrador (vacío = no cambiar):</label>
+      <input type="password" name="password"
+             style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
+      <hr style="border:none;border-top:1px solid #E5EDFB;margin:8px 0 14px">
+      <label style="font-size:13px;color:var(--muted)">
+        Contraseña usuario de <b>solo lectura</b> (vacío = no cambiar):<br>
+        <span style="font-weight:normal">Este usuario solo puede ver el estado, no respaldar ni modificar nada.</span>
+      </label>
+      <input type="password" name="password_ro"
+             style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 8px">
+      {'<label style="font-size:12px;color:var(--muted)"><input type="checkbox" name="disable_ro"> Deshabilitar usuario de solo lectura</label><br><br>' if CFG.get("readonly_hash") else ''}
+      <button class="btn btn-primary" type="submit" style="width:100%">Guardar</button>
+    </form>
+  </div>
+</div></body></html>"""
+    return cfg_html
+
+
+@app.route("/api/reporte/<mes>")
+def api_reporte(mes):
+    """Devuelve el reporte mensual en texto plano si existe."""
+    if not puede_ver():
+        return "No autorizado", 403
+    rp = estado_dir() / f"reporte_{mes}.txt"
+    if not rp.exists():
+        return f"No hay reporte para {mes} todavía.", 404
+    return rp.read_text(encoding="utf-8"), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 # ──────────────────────────────────────────────── visor de correos ──
@@ -767,6 +934,59 @@ def correos_ver(maquina, mes, cuenta, carpeta, archivo):
   <div class="cuerpo">{body_html}</div>
 </div></body></html>"""
     return html
+
+
+STALE_SECS = 5 * 60
+
+
+def _leer_progreso():
+    """Lee todos los archivos *_progreso.json del directorio de estado."""
+    result = {}
+    d = estado_dir()
+    try:
+        if not d.is_dir():
+            return result
+        for fp in d.glob("*_progreso.json"):
+            machine = fp.stem.replace("_progreso", "")
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                upd = datetime.strptime(data["actualizado"], "%Y-%m-%d %H:%M:%S")
+                age = (datetime.now() - upd).total_seconds()
+                if age > STALE_SECS:
+                    data["etapa"] = "interrumpido"
+                    data["detalle"] = f"Sin señal hace {int(age//60)} min — puede haberse apagado"
+                data["segundos"] = int(age)
+                result[machine] = data
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
+
+
+def _leer_reagendados():
+    """Lee solicitudes de reintento pendientes (escritas por el agente al generar reporte)."""
+    result = {}
+    sol = Path(CFG.get("destino_root", "")) / "_solicitudes"
+    try:
+        if not sol.is_dir():
+            return result
+        for fp in sol.glob("*.json"):
+            machine = fp.stem
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                motivo = data.get("motivo", "")
+                if motivo in ("reagendado_por_error", "reagendado_sin_respaldo"):
+                    result[machine] = {
+                        "motivo": motivo,
+                        "errores": data.get("errores_previos", []),
+                        "pedido_el": data.get("pedido_el", ""),
+                    }
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
 
 
 @app.route("/api/progreso")

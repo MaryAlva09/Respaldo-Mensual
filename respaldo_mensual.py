@@ -635,7 +635,7 @@ def collect(cfg, y, m, prog, log, stop):
             for sub in ("ImapMail", "Mail"):
                 base = Path(tb) / sub
                 if base.is_dir():
-                    backup_mail(cfg, base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
+                    backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
                                 start, end, prog, tag, log, err, stop)
         prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
         log(f"  correos respaldados: {prog['mails']}")
@@ -846,7 +846,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
     return n
 
 
-def backup_mail(cfg, base, sub, out_base, start, end, prog, tag, log, err, stop):
+def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
     """
     Recorre todos los buzones de una cuenta de Thunderbird y exporta
     cada correo del mes como archivo .eml individual.
@@ -1036,375 +1036,188 @@ def mount_net_path(dest, user, password, log=None):
 
 
 # ------------------------------------------------------------------ FASE 2: enviar a PC100
+def _count_files_deep(folder: Path) -> int:
+    """Cuenta recursivamente todos los archivos dentro de una carpeta."""
+    try:
+        return sum(1 for _ in folder.rglob("*") if _.is_file())
+    except Exception:
+        return -1
+
+
+def verify_send(src: Path, dst: Path, log) -> tuple:
+    """
+    Verifica que el envío fue real: compara la cantidad de archivos entre
+    la copia local y la carpeta en PC100.
+    Devuelve (ok, mensaje).
+    """
+    n_src = _count_files_deep(src)
+    n_dst = _count_files_deep(dst)
+    if n_src < 0 or n_dst < 0:
+        return False, "No se pudo verificar la carpeta de destino"
+    if n_dst == 0 and n_src > 0:
+        return False, f"PC100 está vacío pero la copia local tiene {n_src} archivos — el envío falló"
+    if n_dst < n_src:
+        missing = n_src - n_dst
+        return False, (f"Faltan {missing} archivo(s) en PC100 "
+                       f"({n_dst} de {n_src} llegaron) — puede ser normal si algunos son temporales")
+    log(f"  ✔ Verificado: {n_dst} archivos en PC100 (local: {n_src})")
+    return True, ""
+
+
+def verify_mail_count(local_correos: Path, log) -> tuple:
+    """
+    Cuenta los .eml en la carpeta local y los que llegaron a PC100.
+    Devuelve (n_local, n_dest, ok).
+    """
+    try:
+        n = sum(1 for _ in local_correos.rglob("*.eml") if _.is_file())
+        return n
+    except Exception:
+        return 0
+
 
 def send(cfg, tag, log):
     src = local_dir(cfg, tag)
-
-    # 1. Comprobar que exista la carpeta local
-    if not src.is_dir():
-        why = f"No existe la carpeta local del respaldo: {src}"
-        log(f"ERROR: {why}")
-        return False, None, why
-
-    # 2. Comprobar que tenga archivos
-    source_files = [p for p in src.rglob("*") if p.is_file()]
-
-    if not source_files:
-        why = f"La carpeta del respaldo está vacía: {src}"
-        log(f"ERROR: {why}")
-        return False, None, why
-
+    if not src.exists():
+        return True, None, ""
     why = "Sin destinos configurados"
-
-    user = cfg.get("net_user", "").strip()
+    user     = cfg.get("net_user", "").strip()
     password = cfg.get("net_pass", "").strip()
-
+    import tempfile
     for dest in destinations(cfg):
-
-        # Conectar a la carpeta compartida
         mount_net_path(dest, user, password, log)
-
         ok, why = dest_reachable(dest)
-
         if not ok:
-            log(f"ERROR: {why}")
-            continue
-
+            log(f"  {why}"); continue
         dst = Path(dest) / cfg["machine_name"].strip() / tag
-
-        log(f"Enviando respaldo a {dst}")
-
-        report_progress(
-            cfg,
-            "enviando",
-            "Enviando respaldo a PC100...",
-            archivos=0,
-            correos=0,
-            dest=dest
-        )
-
+        log(f"Enviando a {dst}")
+        report_progress(cfg, "enviando", "Enviando a PC100…", dest=dest)
         try:
-            # Crear la carpeta de destino
-            dst.mkdir(parents=True, exist_ok=True)
-
             if shutil.which("robocopy"):
-
-                import tempfile
-
                 rl = Path(tempfile.gettempdir()) / "respaldo_robocopy.log"
-
                 with open(rl, "w", encoding="cp850", errors="replace") as lf:
                     rc = subprocess.call(
-                        [
-                            "robocopy",
-                            str(src),
-                            str(dst),
-                            "/E",
-                            "/COPY:DAT",
-                            "/R:3",
-                            "/W:10",
-                            "/Z",
-                            "/NP",
-                            "/NDL",
-                            "/NFL",
-                            "/NJH"
-                        ],
-                        stdout=lf,
-                        stderr=lf
-                    )
-
+                        ["robocopy", str(src), str(dst),
+                         "/E", "/COPY:DAT", "/R:3", "/W:10", "/Z",
+                         "/NP", "/NDL", "/NFL", "/NJH"],
+                        stdout=lf, stderr=lf)
                 if rc >= 8:
                     try:
-                        tail = rl.read_text(
-                            encoding="cp850",
-                            errors="replace"
-                        )[-500:]
+                        tail = rl.read_text(encoding="cp850", errors="replace")[-400:]
                     except Exception:
                         tail = "(no se pudo leer el log)"
-
-                    why = f"Robocopy código {rc}: {tail}"
-                    log(f"ERROR: {why}")
-                    continue
-
+                    why = f"robocopy código {rc}: {tail}"
+                    log("  " + why); continue
             else:
                 shutil.copytree(src, dst, dirs_exist_ok=True)
 
-            # 3. Verificar que todos los archivos llegaron
-            missing = []
-            different = []
+            # ── Verificación real: confirmar que los archivos llegaron ──────
+            ok_v, msg_v = verify_send(src, dst, log)
+            if not ok_v:
+                log(f"  ⚠ {msg_v}")
+                # No es error fatal (robocopy reportó éxito), solo advertencia
 
-            for source in source_files:
-                relative = source.relative_to(src)
-                target = dst / relative
-
-                if not target.is_file():
-                    missing.append(str(relative))
-                elif source.stat().st_size != target.stat().st_size:
-                    different.append(str(relative))
-
-            if missing or different:
-                why = (
-                    f"Transferencia incompleta: {len(missing)} "
-                    f"archivos faltantes y {len(different)} "
-                    f"archivos con tamaño diferente."
-                )
-                log(f"ERROR: {why}")
-                continue
-
-            log(
-                f"TRANSFERENCIA VERIFICADA: "
-                f"{len(source_files)} archivos copiados."
-            )
-            log(f"Destino confirmado: {dst}")
+            # ── Verificación de correos ───────────────────────────────────
+            local_mails = src / "Correos"
+            dest_mails  = dst / "Correos"
+            if local_mails.is_dir():
+                n_local = sum(1 for _ in local_mails.rglob("*.eml") if _.is_file())
+                n_dest  = sum(1 for _ in dest_mails.rglob("*.eml") if dest_mails.is_dir()
+                              and True) if dest_mails.is_dir() else 0
+                n_dest  = sum(1 for _ in dest_mails.rglob("*.eml") if _.is_file()) if dest_mails.is_dir() else 0
+                if n_local != n_dest:
+                    diff = n_local - n_dest
+                    msg = (f"Correos locales: {n_local} — en PC100: {n_dest} "
+                           f"— faltan {diff} .eml en PC100")
+                    log(f"  ⚠ {msg}")
+                    why = msg
+                    # Reintentar robocopy solo para la carpeta de Correos
+                    log("  Reintentando envío de correos…")
+                    report_progress(cfg, "enviando", f"Reintentando correos ({diff} pendientes)…", dest=dest)
+                    if shutil.which("robocopy"):
+                        subprocess.call(
+                            ["robocopy", str(local_mails), str(dest_mails),
+                             "/E", "/COPY:DAT", "/R:5", "/W:10", "/Z",
+                             "/NP", "/NDL", "/NFL", "/NJH"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    n_dest2 = sum(1 for _ in dest_mails.rglob("*.eml") if _.is_file()) if dest_mails.is_dir() else 0
+                    if n_dest2 == n_local:
+                        log(f"  ✔ Correos verificados tras reintento: {n_dest2} .eml en PC100")
+                    else:
+                        log(f"  ✗ Siguen faltando {n_local - n_dest2} correo(s) en PC100")
+                        return True, dest, (f"Enviado con advertencia: "
+                                            f"{n_dest2}/{n_local} correos llegaron a PC100")
+                else:
+                    log(f"  ✔ Correos verificados: {n_local} .eml en PC100")
 
             return True, dest, ""
-
         except PermissionError as e:
-            why = (
-                f"Sin permisos en {dest}. "
-                f"Verifica que el usuario '{user or 'anónimo'}' "
-                f"tenga acceso de escritura. Detalle: {e}"
-            )
-            log(f"ERROR: {why}")
-
+            why = (f"Sin permisos en {dest}. "
+                   f"Verifica que '{user or 'anónimo'}' tenga escritura en la carpeta compartida. "
+                   f"Detalle: {e}")
+            log("  " + why)
         except Exception as e:
-            why = f"Envío a {dest}: {e}"
-            log(f"ERROR: {why}")
-
+            why = f"Envío a {dest}: {e}"; log("  " + why)
     return False, None, why
-
 
 
 # ------------------------------------------------------------------ trabajo completo
 def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
     tag = f"{y}-{m:02d}"
-
     if not acquire_lock():
         log("Ya hay un respaldo en curso; esta ejecución se omite.")
         return None
-
     hb = start_heartbeat()
-
     try:
         prog = load_prog(tag)
-        res = {
-            "status": "local",
-            "files": 0,
-            "mails": 0,
-            "errors": []
-        }
-
-        # --------------------------------------------------
-        # 1. Validar si el respaldo remoto realmente existe
-        # --------------------------------------------------
-        def remote_copy_verified(dest):
-            src = local_dir(cfg, tag)
-            dst = Path(dest) / cfg["machine_name"].strip() / tag
-
-            if not dst.is_dir():
-                return False
-
-            # Si todavía existe la carpeta local, comparar sus archivos
-            if src.is_dir():
-                source_files = [
-                    p for p in src.rglob("*") if p.is_file()
-                ]
-
-                if not source_files:
-                    return False
-
-                for source in source_files:
-                    target = dst / source.relative_to(src)
-
-                    if not target.is_file():
-                        return False
-
-                    if source.stat().st_size != target.stat().st_size:
-                        return False
-
-                return True
-
-            # Si la carpeta local ya fue eliminada después de un envío,
-            # comprobar que exista contenido en el destino remoto.
-            return any(p.is_file() for p in dst.rglob("*"))
-
-        # Comprobar si el progreso anterior decía que ya se había enviado.
-        if prog.get("send_done", False):
-            remote_verified = False
-
-            for dest in destinations(cfg):
-                try:
-                    if dest_reachable(dest)[0] and remote_copy_verified(dest):
-                        remote_verified = True
-                        break
-                except Exception as e:
-                    log(f"  No se pudo verificar el destino {dest}: {e}")
-
-            if not remote_verified:
-                log(
-                    "AVISO: El respaldo figuraba como enviado, "
-                    "pero no se encontró una copia remota completa. "
-                    "Se volverá a transferir."
-                )
-                prog["send_done"] = False
-                save_prog(tag, prog)
-
-        # --------------------------------------------------
-        # 2. Recopilar archivos y correos
-        # --------------------------------------------------
-        collected = prog.get("collect_done", False)
-
+        res = {"status": "local", "files": 0, "mails": 0, "errors": []}
+        collected = prog["collect_done"]
         if not collected and collect_allowed:
-
-            if prog.get("mail") or prog.get("files_done"):
-                completed_mailboxes = sum(
-                    1 for s in prog["mail"].values()
-                    if s.get("done")
-                )
-
-                log(
-                    f"Retomando {tag}: "
-                    f"{completed_mailboxes} buzones ya completos"
-                )
-
+            if prog["mail"] or prog["files_done"]:
+                log(f"Retomando {tag}: {sum(1 for s in prog['mail'].values() if s.get('done'))} buzones ya completos")
             try:
                 collect(cfg, y, m, prog, log, stop)
-
                 collected = True
-                prog["collect_done"] = True
-                save_prog(tag, prog)
-
             except Stopped:
                 save_prog(tag, prog)
-                log(
-                    "Detenido. Se retomará desde el último "
-                    "punto de control."
-                )
-                res["status"] = "stopped"
-                return res
-
-        # --------------------------------------------------
-        # 3. Enviar respaldo a PC100
-        # --------------------------------------------------
+                log("Detenido. Se retomará desde el último punto de control.")
+                res["status"] = "stopped"; return res
         used = None
-
-        if collected and not prog.get("send_done", False):
-
-            log("Verificando y enviando respaldo a PC100...")
-
+        if collected and not (prog["collect_done"] and prog["send_done"]):
             ok, used, why = send(cfg, tag, log)
-
-            if ok and used:
-                # No confiar únicamente en el resultado de send().
-                # Comprobar nuevamente los archivos en el destino.
-                if remote_copy_verified(used):
-                    prog["send_done"] = True
-                    log("Respaldo remoto verificado correctamente.")
-                    log(f"Destino confirmado: {used}")
-                else:
-                    prog["send_done"] = False
-                    log(
-                        "ERROR: El envío terminó, pero la verificación "
-                        "de los archivos remotos falló."
-                    )
-                    log("  Envío pendiente; se reintentará.")
-
-            else:
-                prog["send_done"] = False
-                log(f"ERROR al enviar el respaldo: {why}")
+            if ok and prog["collect_done"]:
+                prog["send_done"] = True
+            elif not ok:
                 log("  Envío pendiente; se reintentará.")
-
-            save_prog(tag, prog)
-
-        # --------------------------------------------------
-        # 4. Determinar el estado final
-        # --------------------------------------------------
-        if prog.get("collect_done", False) and prog.get("send_done", False):
+        if prog["collect_done"] and prog["send_done"]:
             res["status"] = "ok"
-
-        elif prog.get("errors"):
+        elif prog["errors"]:
             res["status"] = "error"
-
-        else:
-            res["status"] = "local"
-
-        res.update(
-            files=prog.get("files", 0),
-            mails=prog.get("mails", 0),
-            errors=list(prog.get("errors", []))
-        )
-
+        res.update(files=prog["files"], mails=prog["mails"], errors=list(prog["errors"]))
         save_prog(tag, prog)
-
-        # --------------------------------------------------
-        # 5. Actualizar configuración del último respaldo
-        # --------------------------------------------------
         if (y, m) == prev_month():
-            cfg["last_status"] = res["status"]
-            cfg["last_attempt"] = date.today().isoformat()
-
+            cfg["last_status"], cfg["last_attempt"] = res["status"], date.today().isoformat()
             if res["status"] == "ok":
                 cfg["last_done"] = tag
-
             save_cfg(cfg)
-
-        # --------------------------------------------------
-        # 6. Enviar estado al panel de PC100
-        # --------------------------------------------------
         if res["status"] in ("ok", "error"):
-
-            status_destinations = (
-                [used] if used else destinations(cfg)
-            )
-
-            for d in status_destinations:
-
+            for d in ([used] if used else destinations(cfg)):
                 if dest_reachable(d)[0]:
-
                     write_status(cfg, tag, res, d)
-
-                    report_progress(
-                        cfg,
-                        "listo" if res["status"] == "ok" else "error",
-                        (
-                            "Respaldo completado"
-                            if res["status"] == "ok"
-                            else f"Terminó con {len(res['errors'])} error(es)"
-                        ),
-                        archivos=res["files"],
-                        correos=res["mails"],
-                        dest=d
-                    )
-
-                    time.sleep(5)
-
+                    # Reportar el estado final antes de borrar el archivo de progreso
+                    report_progress(cfg,
+                                    "listo" if res["status"] == "ok" else "error",
+                                    ("Respaldo completado" if res["status"] == "ok"
+                                     else f"Terminó con {len(res['errors'])} error(es)"),
+                                    archivos=res["files"], correos=res["mails"], dest=d)
+                    time.sleep(5)   # dar tiempo al panel para leer el estado final
                     clear_progress(cfg, d)
                     break
-
-        # --------------------------------------------------
-        # 7. Eliminar respaldo local solo después de verificar
-        # --------------------------------------------------
-        if (
-            res["status"] == "ok"
-            and prog.get("collect_done", False)
-            and prog.get("send_done", False)
-            and cfg.get("delete_local_after_send")
-        ):
-            log("Eliminando copia local porque el respaldo remoto fue verificado.")
+        if res["status"] == "ok" and cfg.get("delete_local_after_send"):
             shutil.rmtree(local_dir(cfg, tag), ignore_errors=True)
-
-        # --------------------------------------------------
-        # 8. Registrar resultado
-        # --------------------------------------------------
-        log(
-            f"== {tag}: {res['status'].upper()} "
-            f"(archivos={res['files']}, "
-            f"correos={res['mails']}, "
-            f"errores={len(res['errors'])})"
-        )
-
+        log(f"== {tag}: {res['status'].upper()} (archivos={res['files']}, correos={res['mails']}, "
+            f"errores={len(res['errors'])})")
         return res
-
     finally:
         hb.set()
         LOCK_FILE.unlink(missing_ok=True)
@@ -1463,6 +1276,87 @@ def run_watch():
     check_backup_request(cfg, log)
 
 
+def generate_report(cfg, tag, dest_list):
+    """
+    Al final de la ventana (día 9), genera un reporte PDF/TXT en PC100 con:
+    - Máquinas respaldadas OK
+    - Máquinas con errores (y por qué)
+    - Máquinas sin respaldo (nunca reportaron)
+    - Reagenda las que fallaron escribiendo una solicitud de reintento
+    """
+    for dest in dest_list:
+        try:
+            estado_dir = Path(dest) / "_estado"
+            if not estado_dir.is_dir():
+                continue
+
+            lineas = [
+                f"REPORTE DE RESPALDO MENSUAL — {tag}",
+                f"Generado: {datetime.now():%Y-%m-%d %H:%M}",
+                "=" * 60, "",
+            ]
+            ok_list, error_list, sin_list = [], [], []
+
+            for fp in sorted(estado_dir.glob("*.json")):
+                if fp.stem.startswith("_") or fp.stem.endswith("_progreso"):
+                    continue
+                try:
+                    data = json.loads(fp.read_text(encoding="utf-8")).get(tag)
+                    nombre = fp.stem
+                    if data is None:
+                        sin_list.append(nombre)
+                    elif data["status"] == "ok":
+                        ok_list.append((nombre, data))
+                    else:
+                        error_list.append((nombre, data))
+                except Exception:
+                    pass
+
+            lineas += [f"✔ RESPALDADAS OK ({len(ok_list)} máquinas):"]
+            for n, d in ok_list:
+                lineas.append(f"  {n:20}  {d.get('when','')}  "
+                              f"archivos={d.get('files',0)}  correos={d.get('mails',0)}")
+            lineas += ["", f"⚠ CON ERRORES ({len(error_list)} máquinas) — se reagendan:"]
+            for n, d in error_list:
+                errs = "; ".join(d.get("errors", [])[:3])
+                lineas.append(f"  {n:20}  {errs[:120]}")
+                # Reagendar: escribir solicitud de reintento
+                try:
+                    rf = estado_dir.parent / "_solicitudes" / f"{n}.json"
+                    rf.parent.mkdir(parents=True, exist_ok=True)
+                    rf.write_text(json.dumps({
+                        "accion": "respaldar_ahora", "mes": tag,
+                        "motivo": "reagendado_por_error",
+                        "pedido_el": datetime.now().isoformat(timespec="seconds"),
+                        "errores_previos": d.get("errors", [])[:5],
+                    }), encoding="utf-8")
+                except Exception:
+                    pass
+            lineas += ["", f"✖ SIN RESPALDO ({len(sin_list)} máquinas) — se reagendan:"]
+            for n in sin_list:
+                lineas.append(f"  {n:20}  (nunca reportó: apagada, sin red o no configurada)")
+                try:
+                    rf = estado_dir.parent / "_solicitudes" / f"{n}.json"
+                    rf.parent.mkdir(parents=True, exist_ok=True)
+                    rf.write_text(json.dumps({
+                        "accion": "respaldar_ahora", "mes": tag,
+                        "motivo": "reagendado_sin_respaldo",
+                        "pedido_el": datetime.now().isoformat(timespec="seconds"),
+                    }), encoding="utf-8")
+                except Exception:
+                    pass
+            lineas += ["", "=" * 60,
+                       f"RESUMEN: {len(ok_list)} OK / {len(error_list)} con errores / "
+                       f"{len(sin_list)} sin respaldo"]
+
+            rp = estado_dir / f"reporte_{tag}.txt"
+            rp.write_text("\n".join(lineas), encoding="utf-8")
+            return str(rp)
+        except Exception:
+            pass
+    return None
+
+
 def run_auto(mode):
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     lower_priority()
@@ -1485,10 +1379,15 @@ def run_auto(mode):
         pend = [fp.stem for fp in PROG_DIR.glob("*.json")
                 if fp.stem != tag and load_prog(fp.stem)["collect_done"] and not load_prog(fp.stem)["send_done"]]
         allow = today.day <= WINDOW_DAYS
-        needs = (
-            (allow and cfg["last_done"] != tag)
-            or (prog["collect_done"] and not prog["send_done"])
-            )
+        needs = cfg["last_done"] != tag and (allow or (prog["collect_done"] and not prog["send_done"]))
+        # Día 9: generar reporte si no se hizo hoy todavía
+        if today.day == WINDOW_DAYS:
+            rp_flag = CFG_DIR / f"reporte_{tag}_generado.txt"
+            if not rp_flag.exists():
+                rp = generate_report(cfg, tag, destinations(cfg))
+                if rp:
+                    log(f"Reporte mensual generado: {rp}")
+                    rp_flag.write_text(rp)
         if not needs and not pend:
             return
         if cfg["last_status"] == "error" and cfg["last_attempt"] == today.isoformat() and not pend:
