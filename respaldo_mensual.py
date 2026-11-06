@@ -696,7 +696,7 @@ def get_mail_category(relative_path: Path, filename: str) -> str:
     return "Recibidos"
 
 
-def thunderbird_account_labels(profile_dir: Path, mail_subdir: str) -> dict:
+def thunderbird_account_labels(profile_dir: Path) -> dict:
     """Relaciona las carpetas de almacenamiento de Thunderbird con su dirección de correo."""
     prefs_path = profile_dir / "prefs.js"
     if not prefs_path.is_file():
@@ -900,16 +900,13 @@ def backup_mail(base, sub, out_base, cfg, start, end, prog, tag, log, err, stop)
     cada correo del mes como archivo .eml individual.
 
     Estructura final en out_base:
-        Recibidos/
-          2026-10-15_Newsletter_abc12345.eml
-          ...
-        Enviados/
-          2026-10-16_RE-Propuesta_def67890.eml
-          ...
+        <cuenta>/
+          Recibidos/*.eml
+          Enviados/*.eml
     """
     seen_cache = {}
     ids_dir = PROG_DIR / f"{tag}_eml_ids"
-    account_labels = thunderbird_account_labels(Path(base).parent, Path(base).name)
+    account_labels = thunderbird_account_labels(Path(base).parent)
 
     def ids_file(key):
         return ids_dir / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".txt")
@@ -961,7 +958,7 @@ def backup_mail(base, sub, out_base, cfg, start, end, prog, tag, log, err, stop)
                 if not st.get("offset") and p.stat().st_mtime < start.timestamp():
                     st.update(done=True, count=0, version=2); continue
                 resuming = bool(st.get("offset"))
-                log(f"  {category}: {p.name}" + (" (retomando)" if resuming else ""))
+                log(f"  Cuenta {account_folder} — {category}: {p.name}" + (" (retomando)" if resuming else ""))
                 total_mails_so_far = sum(v.get("count", 0) for v in prog["mail"].values()
                                          if isinstance(v, dict))
                 report_progress(
