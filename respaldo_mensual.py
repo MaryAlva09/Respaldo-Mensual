@@ -636,7 +636,7 @@ def collect(cfg, y, m, prog, log, stop):
                 base = Path(tb) / sub
                 if base.is_dir():
                     backup_mail(base, f"{ulabel}:{sub}", dest_root / "Correos" / ulabel / sub,
-                                start, end, prog, tag, log, err, stop)
+                                cfg, start, end, prog, tag, log, err, stop)
         prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
         log(f"  correos respaldados: {prog['mails']}")
     else:
@@ -694,6 +694,54 @@ def get_mail_category(relative_path: Path, filename: str) -> str:
     if any(p in SENT_MAIL for p in parts):
         return "Enviados"
     return "Recibidos"
+
+
+def thunderbird_account_labels(profile_dir: Path, mail_subdir: str) -> dict:
+    """Relaciona las carpetas de almacenamiento de Thunderbird con su dirección de correo."""
+    prefs_path = profile_dir / "prefs.js"
+    if not prefs_path.is_file():
+        return {}
+
+    prefs = {}
+    pref_re = re.compile(r'user_pref\("(.*?)",\s*("(?:\\\\.|[^"\\\\])*"|true|false|-?\\d+)\);')
+    try:
+        for key, value in pref_re.findall(prefs_path.read_text(encoding="utf-8", errors="replace")):
+            try:
+                prefs[key] = json.loads(value)
+            except (ValueError, TypeError):
+                continue
+    except OSError:
+        return {}
+
+    email_by_server = {}
+    account_ids = str(prefs.get("mail.accountmanager.accounts", "")).split(",")
+    for account_id in account_ids:
+        account_id = account_id.strip()
+        if not account_id:
+            continue
+        server_id = prefs.get(f"mail.account.{account_id}.server")
+        identities = str(prefs.get(f"mail.account.{account_id}.identities", "")).split(",")
+        for identity_id in identities:
+            email_addr = str(prefs.get(f"mail.identity.{identity_id.strip()}.useremail", "")).strip()
+            if server_id and email_addr:
+                email_by_server.setdefault(str(server_id), email_addr)
+                break
+
+    labels = {}
+    for key, hostname in prefs.items():
+        match = re.fullmatch(r"mail\.server\.(server\d+)\.hostname", key)
+        if not match:
+            continue
+        server_id = match.group(1)
+        username = str(prefs.get(f"mail.server.{server_id}.userName", "")).strip()
+        directory = str(prefs.get(f"mail.server.{server_id}.directory", "")).strip()
+        directory_rel = str(prefs.get(f"mail.server.{server_id}.directory-rel", "")).strip()
+        label = (email_by_server.get(server_id) or username or str(hostname).strip() or server_id)
+        for folder_name in (str(hostname).strip(), Path(directory).name, Path(directory_rel).name):
+            if folder_name:
+                labels[folder_name.casefold()] = label
+
+    return labels
 
 
 # ------------------------------------------------------------------ correo (streaming + puntos de control)
@@ -846,7 +894,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
     return n
 
 
-def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
+def backup_mail(base, sub, out_base, cfg, start, end, prog, tag, log, err, stop):
     """
     Recorre todos los buzones de una cuenta de Thunderbird y exporta
     cada correo del mes como archivo .eml individual.
@@ -861,6 +909,7 @@ def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
     """
     seen_cache = {}
     ids_dir = PROG_DIR / f"{tag}_eml_ids"
+    account_labels = thunderbird_account_labels(Path(base).parent, Path(base).name)
 
     def ids_file(key):
         return ids_dir / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".txt")
@@ -894,8 +943,12 @@ def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
             if fname.lower() in SKIP_MAIL or not is_mbox(p):
                 continue
             category = get_mail_category(rel, fname)       # "Recibidos" o "Enviados"
+            account_key = rel.parts[0] if rel.parts else "Cuenta_sin_identificar"
+            account_label = account_labels.get(account_key.casefold(), account_key)
+            account_folder = clean_mail_filename(account_label, max_length=80)
+            account_path = Path(base) / account_key
             account_id = hashlib.sha256(
-                str(Path(base).resolve()).lower().encode("utf-8")
+                str(account_path.resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
             mailbox_id = hashlib.sha256(
                 str(p.resolve()).lower().encode("utf-8")
@@ -913,12 +966,12 @@ def backup_mail(base, sub, out_base, start, end, prog, tag, log, err, stop):
                                          if isinstance(v, dict))
                 report_progress(
                     cfg, "correos",
-                    f"{category} — buzón {p.name}"
+                    f"{account_folder} — {category} — buzón {p.name}"
                     + (f" (retomando desde correo {st.get('count', 0)})" if resuming else ""),
                     archivos=prog["files"],
                     correos=total_mails_so_far,
                 )
-                count = filter_mbox(p, out_base / category, ids_file(key),
+                count = filter_mbox(p, out_base / account_folder / category, ids_file(key),
                                     start, end, seen_for(account_id),
                                     st, lambda: save_prog(tag, prog), stop)
                 if count:
