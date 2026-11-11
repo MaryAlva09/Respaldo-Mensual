@@ -20,6 +20,7 @@ real en el disco de PC100 detrás de la carpeta compartida, ej. D:\\Respaldos)
 y te deja fijar la contraseña del panel.
 """
 import os, sys, json, hashlib, secrets
+from werkzeug.security import generate_password_hash, check_password_hash
 from pathlib import Path
 from datetime import datetime, date
 
@@ -541,16 +542,21 @@ def login():
         username = request.form.get("username", "").strip()
         pw = request.form.get("password", "")
         ph = hashlib.sha256(pw.encode()).hexdigest()
-        if username == CFG.get("admin_user", "admin") and ph == CFG["password_hash"]:
-            session["ok"] = True
-            session.pop("readonly", None)
+        stored_admin = CFG.get("password_hash", "")
+        admin_ok = check_password_hash(stored_admin, pw) if stored_admin.startswith(("scrypt:", "pbkdf2:")) else ph == stored_admin
+        if username == CFG.get("admin_user", "admin") and admin_ok:
+            if not stored_admin.startswith(("scrypt:", "pbkdf2:")):
+                CFG["password_hash"] = generate_password_hash(pw); save_cfg(CFG)
+            session.clear(); session["ok"] = True; session["username"] = username
             return redirect(url_for("dashboard"))
         ro = CFG.get("readonly_hash", "")
-        if ro and ph == ro:
-            session["readonly"] = True
-            session.pop("ok", None)
+        reader_ok = (check_password_hash(ro, pw) if ro.startswith(("scrypt:", "pbkdf2:")) else ph == ro) if ro else False
+        if username == CFG.get("readonly_user", "consulta") and reader_ok:
+            if not ro.startswith(("scrypt:", "pbkdf2:")):
+                CFG["readonly_hash"] = generate_password_hash(pw); save_cfg(CFG)
+            session.clear(); session["readonly"] = True; session["username"] = username
             return redirect(url_for("dashboard"))
-        error = "Contraseña incorrecta."
+        error = "Usuario o contraseña incorrectos."
     return render_template_string(LOGIN_HTML, css=Markup(BASE_CSS), error=error)
 
 
@@ -566,7 +572,7 @@ def setup():
             error = "Define una contraseña."
         else:
             CFG["destino_root"] = destino
-            CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
+            CFG["password_hash"] = generate_password_hash(pw)
             save_cfg(CFG)
             return redirect(url_for("login"))
     return render_template_string(SETUP_HTML, css=Markup(BASE_CSS), error=error, destino_root=CFG.get("destino_root", ""))
@@ -759,23 +765,15 @@ def _list_emls(maquina, mes):
     result = []
     if not root.is_dir():
         return result
-    for carpeta_user in sorted(root.iterdir()):
-        if not carpeta_user.is_dir():
-            continue
-        for sub in ("ImapMail", "Mail"):
-            for categoria in ("Recibidos", "Enviados"):
-                cat_dir = carpeta_user / sub / categoria
-                if not cat_dir.is_dir():
-                    continue
-
-        for eml in sorted(cat_dir.glob("*.eml"), reverse=True):
+    for eml in sorted(root.rglob("*.eml"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 raw = eml.read_bytes()
                 msg = _email_mod.message_from_bytes(raw)
                 result.append({
-                    "carpeta": categoria,
-                    "cuenta": carpeta_user.name,
-                    "sub": sub,
+                    "carpeta": ("Enviados" if "enviados" in [p.casefold() for p in eml.relative_to(root).parts] else
+                                "Recibidos" if "recibidos" in [p.casefold() for p in eml.relative_to(root).parts] else "Personalizada"),
+                    "cuenta": next((p for p in eml.relative_to(root).parts if p.startswith("Correo ")), "Cuenta"),
+                    "ruta": eml.relative_to(root).as_posix(),
                     "archivo": eml.name,
                     "de": _parse_header(msg.get("From", "")),
                     "para": _parse_header(msg.get("To", "")),
@@ -853,8 +851,7 @@ def correos_lista(maquina, mes):
     emls = _list_emls(maquina, mes)
     filas = ""
     for e in emls:
-        url = url_for("correos_ver", maquina=maquina, mes=mes,
-                      cuenta=e["cuenta"],sub=e["sub"], carpeta=e["carpeta"], archivo=e["archivo"])
+        url = url_for("correos_ver", maquina=maquina, mes=mes, relative_eml=e["ruta"])
         badge = ("#16A34A" if e["carpeta"] == "Recibidos" else "#2563EB")
         filas += (
             f'<tr onclick="location.href=\'{url}\'" style="cursor:pointer">'
@@ -890,14 +887,16 @@ tr:hover td{{background:#F0F7FF}}
     return html
 
 
-@app.route("/correos/<maquina>/<mes>/<cuenta>/<carpeta>/<archivo>")
-def correos_ver(maquina, mes, cuenta, sub, carpeta, archivo):
+@app.route("/correos/<maquina>/<mes>/<path:relative_eml>")
+def correos_ver(maquina, mes, relative_eml):
     if not logueado():
         return redirect(url_for("login"))
     # Validar que el archivo esté dentro de la ruta esperada (sin path traversal)
     root = _correos_root(maquina, mes)
-    eml_path = (root / cuenta / sub / carpeta / archivo).resolve()
-    if not str(eml_path).startswith(str(root.resolve())):
+    eml_path = (root / relative_eml).resolve()
+    try:
+        eml_path.relative_to(root.resolve())
+    except ValueError:
         return "Ruta no permitida", 403
     if not eml_path.exists() or eml_path.suffix.lower() != ".eml":
         return "Correo no encontrado", 404
