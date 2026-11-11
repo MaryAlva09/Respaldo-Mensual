@@ -187,10 +187,22 @@ def month_range(y, m):
 
 def load_prog(tag):
     try:
-        return json.loads((PROG_DIR / f"{tag}.json").read_text(encoding="utf-8"))
+        prog = json.loads((PROG_DIR / f"{tag}.json").read_text(encoding="utf-8"))
     except Exception:
-        return {"files_done": False, "collect_done": False, "send_done": False,
-                "files": 0, "mails": 0, "errors": [], "mail": {}}
+        prog = {"files_done": False, "collect_done": False, "send_done": False,
+                "files": 0, "mails": 0, "errors": [], "warnings": [], "mail": {}}
+    defaults = {
+        "schema_version": 3, "files_found": 0, "files_selected": 0,
+        "files_copied": prog.get("files", 0), "files_skipped": 0,
+        "files_errors": 0, "unclassifiable_mails": 0,
+        "transfer_attempts": 0, "next_retry_at": "",
+    }
+    for key, value in defaults.items():
+        prog.setdefault(key, value)
+    prog.setdefault("warnings", [])
+    prog.setdefault("errors", [])
+    prog.setdefault("mail", {})
+    return prog
 
 
 def save_prog(tag, p):
@@ -585,6 +597,9 @@ def collect(cfg, y, m, prog, log, stop):
 
     if not prog["files_done"]:
         skipped_ext = 0
+        for counter in ("files_found", "files_selected", "files_copied",
+                        "files_skipped", "files_errors"):
+            prog[counter] = 0
         report_progress(cfg, "archivos", "Iniciando copia de archivos…",
                         archivos=prog["files"], correos=prog["mails"])
         for label, sp in all_sources:
@@ -602,27 +617,42 @@ def collect(cfg, y, m, prog, log, stop):
                     if stop():
                         raise Stopped()
                     p = Path(root) / f
+                    prog["files_found"] += 1
                     # Excluir accesos directos, ejecutables, temporales y archivos de sistema
                     if should_skip_file(p, skip_ext):
                         skipped_ext += 1
+                        prog["files_skipped"] += 1
                         continue
                     try:
                         st = p.stat()
-                        if not (ts0 <= st.st_mtime < ts1):
+                        created = getattr(st, "st_birthtime", st.st_ctime)
+                        modified_in_period = ts0 <= st.st_mtime < ts1
+                        created_in_period = ts0 <= created < ts1
+                        if not (modified_in_period or created_in_period):
+                            prog["files_skipped"] += 1
                             continue
+                        prog["files_selected"] += 1
                         out = dest_root / "Archivos" / label / p.relative_to(sp)
                         if out.exists() and out.stat().st_size == st.st_size:
+                            prog["files_copied"] += 1
                             continue
                         out.parent.mkdir(parents=True, exist_ok=True)
                         part = out.with_name(out.name + ".part")
                         shutil.copy2(p, part)
                         os.replace(part, out)
                         prog["files"] += 1
+                        prog["files_copied"] += 1
                     except Exception as e:
+                        prog["files_errors"] += 1
                         err(f"Archivo {p}: {e}")
+                    if prog["files_found"] % 25 == 0:
+                        save_prog(tag, prog)
         if skipped_ext:
             log(f"  {skipped_ext} archivos omitidos por extensión o tipo "
                 f"(.lnk, .exe, carpetas de sistema, etc.)")
+        log(f"  encontrados={prog['files_found']}, seleccionados={prog['files_selected']}, "
+            f"copiados={prog['files_copied']}, omitidos={prog['files_skipped']}, "
+            f"errores={prog['files_errors']}")
         prog["files_done"] = not errors
         save_prog(tag, prog)
         log(f"  archivos nuevos copiados en total: {prog['files']}")
@@ -649,7 +679,12 @@ def collect(cfg, y, m, prog, log, stop):
                     stop
                 )
         prog["mails"] = sum(s.get("count", 0) for s in prog["mail"].values())
-        log(f"  correos respaldados: {prog['mails']}")
+        prog["unclassifiable_mails"] = sum(
+            s.get("unclassifiable", 0) for s in prog["mail"].values()
+            if isinstance(s, dict)
+        )
+        log(f"  correos respaldados: {prog['mails']}; "
+            f"sin fecha clasificable: {prog['unclassifiable_mails']}")
     else:
         err("No se encontró perfil de Thunderbird del usuario objetivo.")
 
