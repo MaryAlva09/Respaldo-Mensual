@@ -38,6 +38,7 @@ CFG_FILE = CFG_DIR / "config.json"
 DEFAULTS = {
     "destino_root": "",
     "admin_user": "admin",
+    "readonly_user": "consulta",
     "password_hash": hashlib.sha256("admin".encode()).hexdigest(),
     "readonly_hash": "",   # contraseña del usuario de solo lectura (vacío = deshabilitado)
     "secret_key": secrets.token_hex(16),
@@ -680,10 +681,13 @@ def config_view():
             CFG["admin_user"] = admin_user
         if destino:
             CFG["destino_root"] = destino
+        readonly_user = request.form.get("readonly_user", "").strip()
+        if readonly_user:
+            CFG["readonly_user"] = readonly_user
         if pw:
-            CFG["password_hash"] = hashlib.sha256(pw.encode()).hexdigest()
+            CFG["password_hash"] = generate_password_hash(pw)
         if pw_ro:
-            CFG["readonly_hash"] = hashlib.sha256(pw_ro.encode()).hexdigest()
+            CFG["readonly_hash"] = generate_password_hash(pw_ro)
         elif request.form.get("disable_ro"):
             CFG["readonly_hash"] = ""
         save_cfg(CFG)
@@ -846,7 +850,7 @@ def _list_attachments(msg):
 
 @app.route("/correos/<maquina>/<mes>")
 def correos_lista(maquina, mes):
-    if not logueado():
+    if not puede_ver():
         return redirect(url_for("login"))
     emls = _list_emls(maquina, mes)
     filas = ""
@@ -889,7 +893,7 @@ tr:hover td{{background:#F0F7FF}}
 
 @app.route("/correos/<maquina>/<mes>/<path:relative_eml>")
 def correos_ver(maquina, mes, relative_eml):
-    if not logueado():
+    if not puede_ver():
         return redirect(url_for("login"))
     # Validar que el archivo esté dentro de la ruta esperada (sin path traversal)
     root = _correos_root(maquina, mes)
