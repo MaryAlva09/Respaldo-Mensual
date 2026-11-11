@@ -14,7 +14,7 @@ programada), esto funciona sin importar qué usuario tenga la sesión iniciada.
 FASE 1 (recopilar): copia lo del mes a una carpeta local oculta (no necesita red).
 FASE 2 (enviar):    la envía a PC100 (reintenta; retoma archivos y correos a medias).
 """
-import os, sys, json, glob, re, time, shutil, socket, hashlib, queue, threading, subprocess
+import os, sys, json, glob, re, time, shutil, socket, hashlib, queue, threading, subprocess, uuid
 import email.utils
 from email.parser import BytesParser
 from email import policy as email_policy
@@ -37,7 +37,7 @@ PROG_DIR = CFG_DIR / "progress"
 WINDOW_DAYS = 9
 CK_SECONDS = 15
 
-USER_SUBDIRS = ["Downloads", "Documents", "Pictures", "Videos", "Desktop"]
+USER_SUBDIRS = ["Downloads", "Descargas", "Documents", "Documentos", "Pictures", "Imágenes", "Videos", "Vídeos", "Desktop", "Escritorio", "Scan"]
 SKIP_USER_NAMES = {"public", "default", "default user", "all users"}
 DEFAULTS = {
     "machine_name": socket.gethostname().upper(),
@@ -698,13 +698,26 @@ def get_mail_filename(message, raw: bytes) -> str:
     return f"{date_text}_{subject}_{fingerprint}.eml"
 
 
-def get_mail_category(relative_path: Path, filename: str) -> str:
-    """Devuelve 'Enviados' o 'Recibidos' según la carpeta del buzón."""
-    parts = [str(x).lower().replace(".sbd", "") for x in relative_path.parts]
-    parts.append(filename.lower())
-    if any(p in SENT_MAIL for p in parts):
-        return "Enviados"
-    return "Recibidos"
+def get_mail_destination(relative_path: Path, filename: str, account_key: str) -> Path:
+    """Categoriza carpetas estándar y conserva la jerarquía de carpetas personalizadas."""
+    parts = [str(x[:-4] if x.lower().endswith(".sbd") else x)
+             for x in relative_path.parts]
+    if parts and parts[0].casefold() == account_key.casefold():
+        parts = parts[1:]
+    mailbox = Path(filename).stem
+    all_parts = parts + [mailbox]
+    normalized = [x.strip().lower() for x in all_parts]
+    if any(x in SENT_MAIL for x in normalized):
+        category = "Enviados"
+    elif any(x in {"inbox", "inbox messages", "recibidos", "received"} for x in normalized):
+        category = "Recibidos"
+    else:
+        safe = [clean_mail_filename(x, 80) for x in all_parts if x and x != "."]
+        return Path("Carpetas personalizadas").joinpath(*(safe or ["Sin_nombre"]))
+    ancestors = [clean_mail_filename(x, 80) for x in all_parts
+                 if x and x != "." and x.strip().lower() not in SENT_MAIL
+                 and x.strip().lower() not in {"inbox", "inbox messages", "recibidos", "received"}]
+    return Path(category).joinpath(*ancestors)
 
 
 # ------------------------------------------------------------------ correo (streaming + puntos de control)
@@ -718,14 +731,28 @@ def is_mbox(p: Path):
         return False
 
 
-def _date_of(hdr, from_line):
+def _local_datetime(value):
     try:
-        d = email.utils.parsedate_to_datetime(hdr.get("Date", ""))
+        d = email.utils.parsedate_to_datetime(value)
         return d.astimezone().replace(tzinfo=None) if d.tzinfo else d
     except Exception:
-        pass
+        return None
+
+
+def _date_of(hdr, from_line):
+    """Usa Date, Received y por último la fecha de sobre MBOX; nunca el mtime del MBOX."""
+    d = _local_datetime(hdr.get("Date", ""))
+    if d:
+        return d
+    received = hdr.get_all("Received", [])
+    for header in reversed(received):
+        d = _local_datetime(header.rsplit(";", 1)[-1].strip())
+        if d:
+            return d
     try:
-        return datetime.strptime(from_line.decode("latin-1").split(None, 2)[2].strip(), "%a %b %d %H:%M:%S %Y")
+        return datetime.strptime(
+            from_line.decode("latin-1").split(None, 2)[2].strip(),
+            "%a %b %d %H:%M:%S %Y")
     except Exception:
         return None
 
@@ -758,7 +785,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
         head = hashlib.sha1(fh.read(4096)).hexdigest()
         off = st.get("offset", 0)
         valid = (off > 0
-                 and st.get("version") == 2
+                 and st.get("version") == 3
                  and st.get("head") == head
                  and os.path.getsize(src) >= off
                  and _h(fh, off, 128) == st.get("tail")
@@ -785,7 +812,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
 
         def checkpoint(boundary):
             flush_ids()
-            st.update(version=2, offset=boundary, count=n, head=head,
+            st.update(version=3, offset=boundary, count=n, head=head,
                       tail=_h(fh, boundary, 128),
                       ids_size=ids_path.stat().st_size if ids_path.exists() else 0)
             save()
@@ -805,9 +832,12 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
                     return
             except (ValueError, AttributeError):
                 pass
-            # Filtrar por fecha del mes
+            # Filtrar por la fecha propia del mensaje y dejar constancia si no se recupera.
             d = _date_of(message, buf[0])
-            if d is None or not (start <= d < end):
+            if d is None:
+                st["unclassifiable"] = st.get("unclassifiable", 0) + 1
+                return
+            if not (start <= d < end):
                 return
             # Deduplicar por Message-ID o huella del contenido
             mid = " ".join((message.get("Message-ID") or "").split())
@@ -833,7 +863,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
                 line = fh.readline()
                 if not line:
                     break
-                if prev_blank and line.startswith(b"From "):
+                if line.startswith(b"From "):
                     flush()
                     msgs_since_ck += 1
                     if time.time() - last_ck >= CK_SECONDS or msgs_since_ck >= 25:
@@ -848,7 +878,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
                 pos += len(line)
             flush()
             flush_ids()
-            st.update(version=2, done=True, count=n, offset=pos, head=head,
+            st.update(version=3, done=True, count=n, offset=pos, head=head,
                       tail=_h(fh, pos, 128),
                       ids_size=ids_path.stat().st_size if ids_path.exists() else 0)
             save()
@@ -866,6 +896,13 @@ def backup_mail(cfg, base, sub, out_base, start, end,
     """
     seen_cache = {}
     ids_dir = PROG_DIR / f"{tag}_eml_ids"
+    account_dirs = sorted(
+        p.name for p in Path(base).iterdir()
+        if p.is_dir() and p.name.lower() not in SKIP_MAIL and not p.name.startswith(".")
+    ) if Path(base).is_dir() else []
+    account_labels = {name: f"Correo {i + 1}" for i, name in enumerate(account_dirs)}
+    if not account_labels:
+        account_labels["Cuenta_sin_identificar"] = "Correo 1"
 
     def ids_file(key):
         return ids_dir / (
@@ -875,7 +912,7 @@ def backup_mail(cfg, base, sub, out_base, start, end,
     def seen_for(account_id):
         if account_id not in seen_cache:
             s = set()
-            prefix = f"EML/{account_id}/"
+            prefix = f"EML3/{account_id}/"
 
             for k, v in prog["mail"].items():
                 if not k.startswith(prefix):
@@ -924,10 +961,10 @@ def backup_mail(cfg, base, sub, out_base, start, end,
             if fname.lower() in SKIP_MAIL or not is_mbox(p):
                 continue
 
-            category = get_mail_category(rel, fname)
-
             account_key = rel.parts[0] if rel.parts else "Cuenta_sin_identificar"
-            account_folder = clean_mail_filename(account_key, max_length=80)
+            account_folder = account_labels.get(account_key, "Correo 1")
+            mail_relative = get_mail_destination(rel, fname, account_key)
+            category = mail_relative.parts[0]
             account_path = Path(base) / account_key
 
             account_id = hashlib.sha256(
@@ -938,7 +975,7 @@ def backup_mail(cfg, base, sub, out_base, start, end,
                 str(p.resolve()).lower().encode("utf-8")
             ).hexdigest()[:16]
 
-            key = f"EML/{account_id}/{mailbox_id}"
+            key = f"EML3/{account_id}/{mailbox_id}"
             st = prog["mail"].setdefault(key, {})
 
             if st.get("done"):
@@ -949,7 +986,7 @@ def backup_mail(cfg, base, sub, out_base, start, end,
                     not st.get("offset")
                     and p.stat().st_mtime < start.timestamp()
                 ):
-                    st.update(done=True, count=0, version=2)
+                    st.update(done=True, count=0, version=3)
                     continue
 
                 resuming = bool(st.get("offset"))
@@ -978,9 +1015,10 @@ def backup_mail(cfg, base, sub, out_base, start, end,
                     correos=total_mails_so_far,
                 )
 
+                previous_unclassifiable = st.get("unclassifiable", 0)
                 count = filter_mbox(
                     p,
-                    out_base / account_folder / category,
+                    out_base / account_folder / mail_relative,
                     ids_file(key),
                     start,
                     end,
@@ -992,6 +1030,9 @@ def backup_mail(cfg, base, sub, out_base, start, end,
 
                 if count:
                     log(f"    {count} correos exportados como .eml")
+                newly_unclassifiable = st.get("unclassifiable", 0) - previous_unclassifiable
+                if newly_unclassifiable > 0:
+                    log(f"    {newly_unclassifiable} mensaje(s) sin fecha recuperable; no se asignaron al mes")
 
             except Stopped:
                 raise
