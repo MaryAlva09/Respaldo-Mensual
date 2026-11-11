@@ -503,6 +503,24 @@ def test_destinations(cfg, log):
     return results
 
 
+
+def write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode):
+    """Guarda un registro independiente por ejecución para consultas y auditoría."""
+    entry = {
+        "execution_id": execution_id, "machine": cfg.get("machine_name", ""),
+        "user": os.environ.get("USERNAME") or os.environ.get("USER", ""),
+        "period": tag, "started_at": started_at, "ended_at": datetime.now().astimezone().isoformat(),
+        "mode": mode, "files_found": prog.get("files_found", 0),
+        "files_selected": prog.get("files_selected", 0), "files_copied": prog.get("files_copied", 0),
+        "mails_processed": prog.get("mails", 0), "mails_unclassifiable": prog.get("unclassifiable_mails", 0),
+        "transfer_attempts": prog.get("transfer_attempts", 0),
+        "verification_status": prog.get("verification_status", "pending"),
+        "errors": list(res.get("errors", []))[:200], "status": res.get("status", "partial"),
+    }
+    path = Path(cfg.get("history_root") or (CFG_DIR / "historial")) / cfg.get("machine_name", "equipo") / f"{execution_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
+    return entry
 def write_status(cfg, tag, res, dest):
     try:
         d = Path(dest) / "_estado"
@@ -1339,6 +1357,8 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
     hb = start_heartbeat()
     try:
         prog = load_prog(tag)
+        execution_id = str(uuid.uuid4())
+        started_at = datetime.now().astimezone().isoformat()
         res = {"status": "local", "files": 0, "mails": 0, "errors": []}
         collected = prog["collect_done"]
         if not collected and collect_allowed:
@@ -1353,7 +1373,7 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
                 res["status"] = "stopped"; return res
         used = None
         if collected and not (prog["collect_done"] and prog["send_done"]):
-            ok, used, why = send(cfg, tag, log)
+            ok, used, why = send(cfg, tag, log, prog)
             if ok and prog["collect_done"]:
                 prog["send_done"] = True
             elif not ok:
@@ -1362,8 +1382,15 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
             res["status"] = "ok"
         elif prog["errors"]:
             res["status"] = "error"
+        if prog.get("files_errors") or prog.get("unclassifiable_mails"):
+            if res["status"] == "ok": res["status"] = "partial"
         res.update(files=prog["files"], mails=prog["mails"], errors=list(prog["errors"]))
         save_prog(tag, prog)
+        try:
+            write_execution_history(cfg, tag, prog, res, started_at, execution_id,
+                                    "scheduled" if collect_allowed else "resume")
+        except Exception as exc:
+            log(f"No se pudo guardar el historial local: {exc}")
         if (y, m) == prev_month():
             cfg["last_status"], cfg["last_attempt"] = res["status"], date.today().isoformat()
             if res["status"] == "ok":
@@ -1547,8 +1574,10 @@ def run_auto(mode):
                 return                                            # aún no es su turno en esta hora
         pend = [fp.stem for fp in PROG_DIR.glob("*.json")
                 if fp.stem != tag and load_prog(fp.stem)["collect_done"] and not load_prog(fp.stem)["send_done"]]
-        allow = today.day <= WINDOW_DAYS
-        needs = cfg["last_done"] != tag and (allow or (prog["collect_done"] and not prog["send_done"]))
+        now = datetime.now()
+        allow = today.day <= WINDOW_DAYS and today.weekday() < 6 and now.hour >= 9
+        needs = cfg["last_done"] != tag and (allow or (prog["files_done"] or bool(prog["mail"]) or
+                 (prog["collect_done"] and not prog["send_done"])))
         # Día 9: generar reporte si no se hizo hoy todavía
         if today.day == WINDOW_DAYS:
             rp_flag = CFG_DIR / f"reporte_{tag}_generado.txt"
