@@ -1193,121 +1193,141 @@ def _count_files_deep(folder: Path) -> int:
         return -1
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def verify_send(src: Path, dst: Path, log) -> tuple:
-    """
-    Verifica que el envío fue real: compara la cantidad de archivos entre
-    la copia local y la carpeta en PC100.
-    Devuelve (ok, mensaje).
-    """
-    n_src = _count_files_deep(src)
-    n_dst = _count_files_deep(dst)
-    if n_src < 0 or n_dst < 0:
-        return False, "No se pudo verificar la carpeta de destino"
-    if n_dst == 0 and n_src > 0:
-        return False, f"PC100 está vacío pero la copia local tiene {n_src} archivos — el envío falló"
-    if n_dst < n_src:
-        missing = n_src - n_dst
-        return False, (f"Faltan {missing} archivo(s) en PC100 "
-                       f"({n_dst} de {n_src} llegaron) — puede ser normal si algunos son temporales")
-    log(f"  ✔ Verificado: {n_dst} archivos en PC100 (local: {n_src})")
+    """Verifica que cada archivo recopilado exista en PC100 con tamaño y SHA-256 iguales."""
+    if not src.is_dir() or not dst.is_dir():
+        return False, "No se encontró la carpeta local o la carpeta de PC100"
+
+    source_files = {
+        p.relative_to(src).as_posix().casefold(): p
+        for p in src.rglob("*") if p.is_file() and not p.name.endswith(".part")
+    }
+    target_files = {
+        p.relative_to(dst).as_posix().casefold(): p
+        for p in dst.rglob("*") if p.is_file() and not p.name.endswith(".part")
+    }
+    missing = sorted(set(source_files) - set(target_files))
+    if missing:
+        return False, f"Faltan {len(missing)} archivo(s) en PC100; ejemplo: {missing[0]}"
+    for rel, source in source_files.items():
+        target = target_files[rel]
+        try:
+            if source.stat().st_size != target.stat().st_size:
+                return False, f"Tamaño distinto después de transferir: {rel}"
+            if _sha256_file(source) != _sha256_file(target):
+                return False, f"SHA-256 distinto después de transferir: {rel}"
+        except OSError as exc:
+            return False, f"No se pudo verificar {rel}: {exc}"
+    log(f"  ✔ Verificados {len(source_files)} archivos por tamaño y SHA-256")
     return True, ""
 
 
-def verify_mail_count(local_correos: Path, log) -> tuple:
-    """
-    Cuenta los .eml en la carpeta local y los que llegaron a PC100.
-    Devuelve (n_local, n_dest, ok).
-    """
-    try:
-        n = sum(1 for _ in local_correos.rglob("*.eml") if _.is_file())
-        return n
-    except Exception:
-        return 0
-
-
-def send(cfg, tag, log):
+def send(cfg, tag, log, prog=None):
+    """Transfiere y verifica. Hace el intento inicial y hasta tres reintentos (5, 15 y 30 min)."""
     src = local_dir(cfg, tag)
-    if not src.exists():
-        return True, None, ""
-    why = "Sin destinos configurados"
-    user     = cfg.get("net_user", "").strip()
-    password = cfg.get("net_pass", "").strip()
-    import tempfile
-    for dest in destinations(cfg):
-        mount_net_path(dest, user, password, log)
-        ok, why = dest_reachable(dest)
-        if not ok:
-            log(f"  {why}"); continue
-        dst = Path(dest) / cfg["machine_name"].strip() / tag
-        log(f"Enviando a {dst}")
-        report_progress(cfg, "enviando", "Enviando a PC100…", dest=dest)
+    if not src.is_dir():
+        return False, None, "No existe la recopilación local que se debe transferir"
+
+    prog = prog if prog is not None else load_prog(tag)
+    due = prog.get("next_retry_at", "")
+    if due:
         try:
-            if shutil.which("robocopy"):
-                rl = Path(tempfile.gettempdir()) / "respaldo_robocopy.log"
-                with open(rl, "w", encoding="cp850", errors="replace") as lf:
-                    rc = subprocess.call(
-                        ["robocopy", str(src), str(dst),
-                         "/E", "/COPY:DAT", "/R:3", "/W:10", "/Z",
-                         "/NP", "/NDL", "/NFL", "/NJH"],
-                        stdout=lf, stderr=lf)
-                if rc >= 8:
-                    try:
-                        tail = rl.read_text(encoding="cp850", errors="replace")[-400:]
-                    except Exception:
-                        tail = "(no se pudo leer el log)"
-                    why = f"robocopy código {rc}: {tail}"
-                    log("  " + why); continue
-            else:
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+            due_dt = datetime.fromisoformat(due)
+            if datetime.now() < due_dt:
+                return False, None, f"Reintento pendiente para {due_dt:%Y-%m-%d %H:%M}"
+        except ValueError:
+            prog["next_retry_at"] = ""
 
-            # ── Verificación real: confirmar que los archivos llegaron ──────
-            ok_v, msg_v = verify_send(src, dst, log)
-            if not ok_v:
-                log(f"  ⚠ {msg_v}")
-                # No es error fatal (robocopy reportó éxito), solo advertencia
+    retry_delays = (300, 900, 1800)
+    user = cfg.get("net_user", "").strip()
+    password = cfg.get("net_pass", "").strip()
+    why = "Sin destinos configurados"
 
-            # ── Verificación de correos ───────────────────────────────────
-            local_mails = src / "Correos"
-            dest_mails  = dst / "Correos"
-            if local_mails.is_dir():
-                n_local = sum(1 for _ in local_mails.rglob("*.eml") if _.is_file())
-                n_dest  = sum(1 for _ in dest_mails.rglob("*.eml") if dest_mails.is_dir()
-                              and True) if dest_mails.is_dir() else 0
-                n_dest  = sum(1 for _ in dest_mails.rglob("*.eml") if _.is_file()) if dest_mails.is_dir() else 0
-                if n_local != n_dest:
-                    diff = n_local - n_dest
-                    msg = (f"Correos locales: {n_local} — en PC100: {n_dest} "
-                           f"— faltan {diff} .eml en PC100")
-                    log(f"  ⚠ {msg}")
-                    why = msg
-                    # Reintentar robocopy solo para la carpeta de Correos
-                    log("  Reintentando envío de correos…")
-                    report_progress(cfg, "enviando", f"Reintentando correos ({diff} pendientes)…", dest=dest)
-                    if shutil.which("robocopy"):
-                        subprocess.call(
-                            ["robocopy", str(local_mails), str(dest_mails),
-                             "/E", "/COPY:DAT", "/R:5", "/W:10", "/Z",
-                             "/NP", "/NDL", "/NFL", "/NJH"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    n_dest2 = sum(1 for _ in dest_mails.rglob("*.eml") if _.is_file()) if dest_mails.is_dir() else 0
-                    if n_dest2 == n_local:
-                        log(f"  ✔ Correos verificados tras reintento: {n_dest2} .eml en PC100")
-                    else:
-                        log(f"  ✗ Siguen faltando {n_local - n_dest2} correo(s) en PC100")
-                        return True, dest, (f"Enviado con advertencia: "
-                                            f"{n_dest2}/{n_local} correos llegaron a PC100")
+    while prog.get("transfer_attempts", 0) < 4:
+        attempt = prog.get("transfer_attempts", 0) + 1
+        prog["transfer_attempts"] = attempt
+        prog["transfer_status"] = "in_progress"
+        prog["verification_status"] = "pending"
+        save_prog(tag, prog)
+        attempt_failed = True
+
+        for dest in destinations(cfg):
+            mount_net_path(dest, user, password, log)
+            reachable, reason = dest_reachable(dest)
+            if not reachable:
+                why = reason
+                log(f"  Intento {attempt}/4: {why}")
+                continue
+
+            dst = Path(dest) / cfg["machine_name"].strip() / tag
+            log(f"Intento de transferencia {attempt}/4 a {dst}")
+            report_progress(cfg, "enviando", f"Intento {attempt}/4: enviando a PC100…", dest=dest)
+            try:
+                if shutil.which("robocopy"):
+                    import tempfile
+                    log_path = Path(tempfile.gettempdir()) / "respaldo_robocopy.log"
+                    with open(log_path, "w", encoding="cp850", errors="replace") as lf:
+                        code = subprocess.call(
+                            ["robocopy", str(src), str(dst), "/E", "/COPY:DAT",
+                             "/R:0", "/W:0", "/Z", "/NP", "/NDL", "/NFL", "/NJH"],
+                            stdout=lf, stderr=lf)
+                    if code >= 8:
+                        try:
+                            detail = log_path.read_text(encoding="cp850", errors="replace")[-400:]
+                        except Exception:
+                            detail = "sin detalle de robocopy"
+                        why = f"Robocopy falló (código {code}): {detail}"
+                        log("  " + why)
+                        continue
                 else:
-                    log(f"  ✔ Correos verificados: {n_local} .eml en PC100")
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
 
-            return True, dest, ""
-        except PermissionError as e:
-            why = (f"Sin permisos en {dest}. "
-                   f"Verifica que '{user or 'anónimo'}' tenga escritura en la carpeta compartida. "
-                   f"Detalle: {e}")
-            log("  " + why)
-        except Exception as e:
-            why = f"Envío a {dest}: {e}"; log("  " + why)
-    return False, None, why
+                verified, reason = verify_send(src, dst, log)
+                if not verified:
+                    why = reason
+                    log(f"  Verificación fallida: {why}")
+                    continue
+
+                prog["transfer_status"] = "verified"
+                prog["verification_status"] = "verified"
+                prog["next_retry_at"] = ""
+                save_prog(tag, prog)
+                return True, dest, ""
+
+            except PermissionError as exc:
+                why = f"Sin permisos en {dest}: {exc}"
+                log("  " + why)
+            except Exception as exc:
+                why = f"Error transfiriendo a {dest}: {exc}"
+                log("  " + why)
+
+        if attempt >= 4:
+            break
+        delay = retry_delays[attempt - 1]
+        due_dt = datetime.fromtimestamp(datetime.now().timestamp() + delay)
+        prog["transfer_status"] = "pending"
+        prog["verification_status"] = "failed"
+        prog["next_retry_at"] = due_dt.isoformat(timespec="seconds")
+        save_prog(tag, prog)
+        log(f"  Reintento {attempt}/3 programado para {due_dt:%Y-%m-%d %H:%M}")
+        report_progress(cfg, "enviando", f"Transferencia pendiente; reintento {attempt}/3", dest=None)
+        time.sleep(delay)
+        prog["next_retry_at"] = ""
+        save_prog(tag, prog)
+
+    prog["transfer_status"] = "pending"
+    prog["verification_status"] = "failed"
+    prog["next_retry_at"] = ""
+    save_prog(tag, prog)
+    return False, None, f"Se agotaron cuatro intentos; queda pendiente: {why}"
 
 
 # ------------------------------------------------------------------ trabajo completo
