@@ -134,7 +134,7 @@ def leer_estado(tag):
                         "archivos": None, "correos": None, "errores": [],
                         "red_ok": red_ok})
         else:
-            ok = r.get("status") == "ok"
+            ok = r.get("status") in ("ok", "verified")
             out.append({"maquina": nm, "estado": "ok" if ok else "error",
                         "cuando": r.get("when"), "archivos": r.get("files"),
                         "correos": r.get("mails"), "errores": r.get("errors", []),
