@@ -19,7 +19,7 @@ La primera vez te pedirá la carpeta local de los respaldos (la ruta
 real en el disco de PC100 detrás de la carpeta compartida, ej. D:\\Respaldos)
 y te deja fijar la contraseña del panel.
 """
-import os, sys, json, hashlib, secrets, shutil
+import os, sys, json, hashlib, secrets, shutil, uuid
 from werkzeug.security import generate_password_hash, check_password_hash
 from pathlib import Path
 from datetime import datetime, date
