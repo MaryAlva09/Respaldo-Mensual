@@ -1365,6 +1365,9 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True, mode="sche
     hb = start_heartbeat()
     try:
         prog = load_prog(tag)
+        if mode == "manual" and prog.get("send_done"):
+            reset_month(cfg, tag)
+            prog = load_prog(tag)
         execution_id = str(uuid.uuid4())
         started_at = datetime.now().astimezone().isoformat()
         res = {"status": "pending", "files": 0, "mails": 0, "errors": []}
@@ -1605,10 +1608,12 @@ def run_auto(mode):
                 return                                            # aún no es su turno en esta hora
         pend = sorted([fp.stem for fp in PROG_DIR.glob("*.json")
                 if fp.stem != tag and not load_prog(fp.stem)["send_done"] and
+                (not load_prog(fp.stem)["collect_done"] or load_prog(fp.stem).get("transfer_attempts", 0) < 4) and
                 (load_prog(fp.stem)["files_done"] or bool(load_prog(fp.stem)["mail"]) or load_prog(fp.stem)["collect_done"])])
         now = datetime.now()
         allow = today.day <= WINDOW_DAYS and today.weekday() < 6 and now.hour >= 9
-        needs = cfg["last_done"] != tag and (allow or (prog["files_done"] or bool(prog["mail"]) or
+        retryable = not (prog["collect_done"] and prog["send_done"]) and (not prog["collect_done"] or prog.get("transfer_attempts", 0) < 4)
+        needs = cfg["last_done"] != tag and retryable and (allow or (prog["files_done"] or bool(prog["mail"]) or
                  (prog["collect_done"] and not prog["send_done"])))
         # Día 9: generar reporte si no se hizo hoy todavía
         if today.day == WINDOW_DAYS:
