@@ -1,7 +1,7 @@
 # Respaldo Mensual
 
-Sistema automático de respaldo mensual para organizaciones con muchas laptops Windows.  
-Respalda archivos y correos de Thunderbird (Gmail IMAP) el día 1 de cada mes, sin intervención del usuario.
+Sistema automático de respaldo mensual para organizaciones con laptops Windows.  
+Respalda archivos y correos de Thunderbird durante la ventana de los días 1–9, lunes a sábado, con reanudación de interrupciones.
 
 ---
 
