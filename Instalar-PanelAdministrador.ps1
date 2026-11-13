@@ -59,6 +59,12 @@ $ajustes    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfG
 Register-ScheduledTask -TaskName $NombreTarea -Action $accion -Trigger $disparador `
     -Principal $principal -Settings $ajustes -Force | Out-Null
 
+# Copia diaria del historial verificada en el destino independiente configurado.
+$accionHistorial = New-ScheduledTaskAction -Execute $exe -Argument "--backup-history"
+$disparadorHistorial = New-ScheduledTaskTrigger -Daily -At "1:00AM"
+Register-ScheduledTask -TaskName "$NombreTarea-Historial" -Action $accionHistorial `
+    -Trigger $disparadorHistorial -Principal $principal -Settings $ajustes -Force | Out-Null
+
 Write-Host "Iniciando el panel ahora mismo (no hace falta reiniciar PC100)..."
 Start-ScheduledTask -TaskName $NombreTarea
 Start-Sleep -Seconds 2
