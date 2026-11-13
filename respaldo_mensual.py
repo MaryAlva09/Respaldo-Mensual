@@ -517,7 +517,9 @@ def write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode,
         "mode": mode, "requested_by": requested_by, "files_found": prog.get("files_found", 0),
         "files_selected": prog.get("files_selected", 0), "files_copied": prog.get("files_copied", 0),
         "files_skipped": prog.get("files_skipped", 0), "files_errors": prog.get("files_errors", 0),
-        "mails_processed": prog.get("mails", 0), "mails_unclassifiable": prog.get("unclassifiable_mails", 0),
+        "mails_processed": sum(v.get("processed", 0) for v in prog.get("mail", {}).values() if isinstance(v, dict)),
+        "mails_converted": prog.get("mails", 0), "mail_errors": prog.get("mail_errors", 0),
+        "mails_unclassifiable": prog.get("unclassifiable_mails", 0),
         "transfer_attempts": prog.get("transfer_attempts", 0),
         "verification_status": prog.get("verification_status", "pending"),
         "collection_status": "complete" if prog.get("collect_done") else ("partial" if prog.get("files_done") or prog.get("mail") else "pending"),
@@ -888,6 +890,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
                 return
             # Parsear con política moderna para acceso correcto a cabeceras
             message = BytesParser(policy=email_policy.default).parsebytes(raw)
+            st["processed"] = st.get("processed", 0) + 1
             # Filtrar mensajes eliminados (bit 0x0008 de Thunderbird)
             try:
                 if int((message.get("X-Mozilla-Status", "0") or "0").strip(), 16) & 0x0008:
@@ -917,6 +920,7 @@ def filter_mbox(src: Path, out_dir: Path, ids_path: Path,
             seen.add(unique_id)
             new_ids.append(unique_id)
             n += 1
+            st["converted"] = st.get("converted", 0) + 1
 
         try:
             fh.seek(off)
@@ -1093,6 +1097,7 @@ def backup_mail(cfg, base, sub, out_base, start, end,
                 raise
 
             except Exception as e:
+                prog["mail_errors"] = prog.get("mail_errors", 0) + 1
                 err(f"Correo {key}: {e}")
 
     save_prog(tag, prog)
