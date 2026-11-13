@@ -1125,6 +1125,11 @@ def api_historial():
     user = request.args.get("usuario", "").strip()
     if any(x in machine for x in ("/", "\\", "..")):
         return jsonify({"error": "máquina inválida"}), 400
+    if execution_id:
+        try:
+            execution_id = str(uuid.UUID(execution_id))
+        except ValueError:
+            return jsonify({"error": "execution_id inválido"}), 400
     root = Path(CFG.get("destino_root", "")) / "_historial"
     files = [root / machine / f"{execution_id}.json"] if machine and execution_id else (list(root.rglob("*.json")) if root.exists() else [])
     records = []
@@ -1166,8 +1171,12 @@ def api_traslados():
     period = str(data.get("mes", "")).strip()
     execution_id = str(data.get("execution_id", "")).strip()
     disk = str(data.get("disco", "")).strip()
-    if not machine or not disk or len(period) != 7 or period[4] != "-" or not period[:4].isdigit() or not period[5:].isdigit() or not 1 <= int(period[5:]) <= 12:
+    if not machine or any(x in machine for x in ("/", "\\", "..")) or not disk or len(period) != 7 or period[4] != "-" or not period[:4].isdigit() or not period[5:].isdigit() or not 1 <= int(period[5:]) <= 12:
         return jsonify({"error": "Máquina, período AAAA-MM y disco externo son obligatorios."}), 400
+    try:
+        execution_id = str(uuid.UUID(execution_id))
+    except ValueError:
+        return jsonify({"error": "execution_id inválido."}), 400
     history = Path(CFG.get("destino_root", "")) / "_historial" / machine / f"{execution_id}.json"
     try:
         execution = json.loads(history.read_text(encoding="utf-8"))
@@ -1195,7 +1204,10 @@ def api_eliminar_respaldo(maquina, periodo):
         return jsonify({"error": "Período inválido."}), 400
     if not maquina or any(x in maquina for x in ("/", "\\", "..")):
         return jsonify({"error": "Máquina inválida."}), 400
-    event_id = str(data.get("event_id", ""))
+    try:
+        event_id = str(uuid.UUID(str(data.get("event_id", ""))))
+    except ValueError:
+        return jsonify({"error": "event_id inválido."}), 400
     event_file = Path(CFG.get("destino_root", "")) / "_traslados" / f"{event_id}.json"
     try:
         event = json.loads(event_file.read_text(encoding="utf-8"))
