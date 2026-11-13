@@ -716,6 +716,9 @@ def config_view():
       <label style="font-size:13px;color:var(--muted)">Carpeta local de los respaldos:</label>
       <input type="text" name="destino_root" value="{CFG.get('destino_root','')}"
              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
+      <label style="font-size:13px;color:var(--muted)">Destino independiente para copia diaria del historial:</label>
+      <input type="text" name="history_backup_root" value="{CFG.get('history_backup_root','')}"
+             style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
 
        <label style="font-size:13px;color:var(--muted)">Certificado TLS (.crt/.pem):</label>
       <input type="text" name="tls_cert" value="{CFG.get('tls_cert','')}" style="width:100%;padding:9px;margin:6px 0 14px">
@@ -733,6 +736,9 @@ def config_view():
         Contraseña usuario de <b>solo lectura</b> (vacío = no cambiar):<br>
         <span style="font-weight:normal">Este usuario solo puede ver el estado, no respaldar ni modificar nada.</span>
       </label>
+       <label style="font-size:13px;color:var(--muted)">Usuario de solo lectura:</label>
+       <input type="text" name="readonly_user" value="{CFG.get('readonly_user', 'consulta')}"
+              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
       <input type="password" name="password_ro"
              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 8px">
       {'<label style="font-size:12px;color:var(--muted)"><input type="checkbox" name="disable_ro"> Deshabilitar usuario de solo lectura</label><br><br>' if CFG.get("readonly_hash") else ''}
