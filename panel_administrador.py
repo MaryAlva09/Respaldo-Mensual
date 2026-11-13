@@ -19,7 +19,7 @@ La primera vez te pedirá la carpeta local de los respaldos (la ruta
 real en el disco de PC100 detrás de la carpeta compartida, ej. D:\\Respaldos)
 y te deja fijar la contraseña del panel.
 """
-import os, sys, json, hashlib, secrets
+import os, sys, json, hashlib, secrets, shutil
 from werkzeug.security import generate_password_hash, check_password_hash
 from pathlib import Path
 from datetime import datetime, date
@@ -37,6 +37,9 @@ CFG_FILE = CFG_DIR / "config.json"
 
 DEFAULTS = {
     "destino_root": "",
+    "history_backup_root": "",
+    "tls_cert": "",
+    "tls_key": "",
     "admin_user": "admin",
     "readonly_user": "consulta",
     "password_hash": hashlib.sha256("admin".encode()).hexdigest(),
@@ -674,6 +677,9 @@ def config_view():
     error = None
     if request.method == "POST":
         destino = request.form.get("destino_root", "").strip()
+        history_backup_root = request.form.get("history_backup_root", "").strip()
+        tls_cert = request.form.get("tls_cert", "").strip()
+        tls_key = request.form.get("tls_key", "").strip()
         pw = request.form.get("password", "").strip()
         pw_ro = request.form.get("password_ro", "").strip()
         admin_user = request.form.get("admin_user", "").strip()
@@ -681,6 +687,12 @@ def config_view():
             CFG["admin_user"] = admin_user
         if destino:
             CFG["destino_root"] = destino
+        if history_backup_root:
+            CFG["history_backup_root"] = history_backup_root
+        if tls_cert:
+            CFG["tls_cert"] = tls_cert
+        if tls_key:
+            CFG["tls_key"] = tls_key
         readonly_user = request.form.get("readonly_user", "").strip()
         if readonly_user:
             CFG["readonly_user"] = readonly_user
@@ -705,7 +717,11 @@ def config_view():
       <input type="text" name="destino_root" value="{CFG.get('destino_root','')}"
              style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px">
 
-       <label style="font-size:13px;color:var(--muted)">Usuario administrador:</label>
+       <label style="font-size:13px;color:var(--muted)">Certificado TLS (.crt/.pem):</label>
+      <input type="text" name="tls_cert" value="{CFG.get('tls_cert','')}" style="width:100%;padding:9px;margin:6px 0 14px">
+      <label style="font-size:13px;color:var(--muted)">Clave TLS (.key):</label>
+      <input type="text" name="tls_key" value="{CFG.get('tls_key','')}" style="width:100%;padding:9px;margin:6px 0 14px">
+      <label style="font-size:13px;color:var(--muted)">Usuario administrador:</label>
        <input type="text" name="admin_user" value="{CFG.get('admin_user', 'admin')}"
               style="width:100%;padding:9px;border:1px solid #D7E2F2;border-radius:8px;margin:6px 0 14px"> 
 
@@ -1049,7 +1065,166 @@ def api_correos(maquina, mes):
     return jsonify({"total": len(emls), "correos": emls})
 
 
+
+
+def _audit_event(action, details=None):
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    record = {"at": datetime.now().astimezone().isoformat(), "username": session.get("username", "system"),
+              "role": "admin" if logueado() else ("readonly" if solo_lectura() else "system"),
+              "action": action, "details": details or {}}
+    with (CFG_DIR / "audit.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def backup_history():
+    source = Path(CFG.get("destino_root", "")) / "_historial"
+    target_root = Path(CFG.get("history_backup_root", ""))
+    if not CFG.get("history_backup_root"):
+        raise RuntimeError("Configura un destino independiente para el historial.")
+    if not source.is_dir():
+        return {"copied": 0, "verified": 0, "status": "empty"}
+    if source.resolve() == target_root.resolve() or source.resolve() in target_root.resolve().parents or target_root.resolve() in source.resolve().parents:
+        raise RuntimeError("El destino del historial no puede estar dentro de la carpeta fuente.")
+    target = target_root / date.today().isoformat()
+    copied = verified = 0
+    for src in source.rglob("*"):
+        if not src.is_file():
+            continue
+        dst = target / src.relative_to(source)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        copied += 1
+        if src.stat().st_size != dst.stat().st_size or _sha256_file(src) != _sha256_file(dst):
+            raise IOError(f"La copia no pasó la verificación SHA-256: {src}")
+        verified += 1
+    return {"copied": copied, "verified": verified, "status": "verified"}
+
+
+@app.route("/api/historial")
+def api_historial():
+    if not puede_ver():
+        return jsonify({"error": "no autorizado"}), 401
+    machine = request.args.get("maquina", "").strip()
+    period = request.args.get("mes", "").strip()
+    execution_id = request.args.get("execution_id", "").strip()
+    if any(x in machine for x in ("/", "\\", "..")):
+        return jsonify({"error": "máquina inválida"}), 400
+    root = Path(CFG.get("destino_root", "")) / "_historial"
+    files = [root / machine / f"{execution_id}.json"] if machine and execution_id else (list(root.rglob("*.json")) if root.exists() else [])
+    records = []
+    for item in files:
+        try:
+            value = json.loads(item.read_text(encoding="utf-8"))
+            if period and value.get("period") != period:
+                continue
+            if machine and value.get("machine", "").casefold() != machine.casefold():
+                continue
+            records.append(value)
+        except (OSError, ValueError):
+            continue
+    records.sort(key=lambda x: x.get("started_at", ""), reverse=True)
+    return jsonify({"total": len(records), "historial": records})
+
+
+@app.route("/api/traslados", methods=["GET", "POST"])
+def api_traslados():
+    folder = Path(CFG.get("destino_root", "")) / "_traslados"
+    if request.method == "GET":
+        if not puede_ver():
+            return jsonify({"error": "no autorizado"}), 401
+        events = []
+        for f in folder.glob("*.json") if folder.exists() else []:
+            try:
+                events.append(json.loads(f.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+        return jsonify({"traslados": events})
+    if not logueado():
+        return jsonify({"error": "solo administrador"}), 403
+    data = request.get_json(silent=True) or {}
+    machine = str(data.get("maquina", "")).strip()
+    period = str(data.get("mes", "")).strip()
+    execution_id = str(data.get("execution_id", "")).strip()
+    disk = str(data.get("disco", "")).strip()
+    if not machine or not disk or len(period) != 7 or period[4] != "-" or not period[:4].isdigit() or not period[5:].isdigit() or not 1 <= int(period[5:]) <= 12:
+        return jsonify({"error": "Máquina, período AAAA-MM y disco externo son obligatorios."}), 400
+    history = Path(CFG.get("destino_root", "")) / "_historial" / machine / f"{execution_id}.json"
+    try:
+        execution = json.loads(history.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return jsonify({"error": "No existe ese execution_id en el historial."}), 404
+    if execution.get("period") != period or execution.get("verification_status") != "verified":
+        return jsonify({"error": "El respaldo debe tener verificación de transferencia."}), 409
+    event = {"event_id": str(uuid.uuid4()), "execution_id": execution_id, "machine": machine, "period": period,
+             "registered_at": datetime.now().astimezone().isoformat(), "administrator": session.get("username"),
+             "disk": disk, "notes": str(data.get("notes", ""))[:1000], "physical_verification": False}
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{event['event_id']}.json").write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+    _audit_event("external_transfer_registered", event)
+    return jsonify({"ok": True, "event": event}), 201
+
+
+@app.route("/api/respaldo/<maquina>/<periodo>", methods=["DELETE"])
+def api_eliminar_respaldo(maquina, periodo):
+    if not logueado():
+        return jsonify({"error": "solo administrador"}), 403
+    data = request.get_json(silent=True) or {}
+    if data.get("confirmacion") != "ELIMINAR":
+        return jsonify({"error": "Escribe ELIMINAR para confirmar."}), 400
+    event_id = str(data.get("event_id", ""))
+    event_file = Path(CFG.get("destino_root", "")) / "_traslados" / f"{event_id}.json"
+    try:
+        event = json.loads(event_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return jsonify({"error": "Registra primero el traslado externo."}), 409
+    if event.get("machine") != maquina or event.get("period") != periodo:
+        return jsonify({"error": "El traslado no corresponde a ese respaldo."}), 409
+    root = Path(CFG["destino_root"]).resolve()
+    target = (root / maquina / periodo).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return jsonify({"error": "Ruta fuera del destino de respaldos."}), 403
+    if not target.is_dir():
+        return jsonify({"error": "No se encontró el respaldo."}), 404
+    shutil.rmtree(target)
+    _audit_event("backup_manually_deleted", {"machine": maquina, "period": periodo, "event_id": event_id})
+    return jsonify({"ok": True})
+
+
+@app.route("/traslados")
+def traslados_view():
+    if not logueado():
+        return redirect(url_for("login"))
+    return """<!doctype html><meta charset="utf-8"><title>Traslados</title>
+    <h1>Registrar traslado a disco externo</h1>
+    <form id="f"><input name="maquina" placeholder="Máquina" required><input name="mes" placeholder="AAAA-MM" required>
+    <input name="execution_id" placeholder="execution_id" required><input name="disco" placeholder="Disco externo" required>
+    <input name="notes" placeholder="Notas"><button>Registrar</button></form><pre id="r"></pre>
+    <script>document.querySelector('#f').onsubmit=async e=>{e.preventDefault();let d=Object.fromEntries(new FormData(e.target));
+    let r=await fetch('/api/traslados',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+    document.querySelector('#r').textContent=await r.text()}</script>"""
 if __name__ == "__main__":
-    print("Panel del administrador — abre http://localhost:5000 en tu navegador")
-    print(f"(o http://<IP de esta PC>:5000 desde otra computadora de la oficina)")
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    if "--backup-history" in sys.argv:
+        try:
+            print(json.dumps(backup_history(), ensure_ascii=False))
+        except Exception as exc:
+            CFG_DIR.mkdir(parents=True, exist_ok=True)
+            with (CFG_DIR / "history_backup_errors.log").open("a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now().isoformat()} {exc}\n")
+            raise
+    else:
+        cert = CFG.get("tls_cert", "").strip()
+        key = CFG.get("tls_key", "").strip()
+        if not cert or not key or not Path(cert).is_file() or not Path(key).is_file():
+            raise SystemExit("Configura un certificado TLS válido (tls_cert/tls_key) antes de exponer el panel.")
+        print("Panel protegido con HTTPS en https://localhost:5000")
+        app.run(host="0.0.0.0", port=5000, threaded=True, ssl_context=(cert, key))
