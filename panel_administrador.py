@@ -1223,7 +1223,7 @@ def historial_view():
         return redirect(url_for("login"))
     return """<!doctype html><meta charset="utf-8"><title>Historial de ejecuciones</title>
     <h1>Historial de respaldos</h1><form id="f"><input name="maquina" placeholder="Máquina">
-    <input name="mes" placeholder="AAAA-MM"><input name="execution_id" placeholder="execution_id">
+    <input name="usuario" placeholder="Usuario Windows"><input name="mes" placeholder="AAAA-MM"><input name="execution_id" placeholder="execution_id">
     <button>Buscar</button></form><pre id="r"></pre>
     <script>document.querySelector('#f').onsubmit=async e=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target));
     let r=await fetch('/api/historial?'+q);document.querySelector('#r').textContent=JSON.stringify(await r.json(),null,2)}</script>"""
@@ -1237,10 +1237,14 @@ def traslados_view():
     <h1>Registrar traslado a disco externo</h1>
     <form id="f"><input name="maquina" placeholder="Máquina" required><input name="mes" placeholder="AAAA-MM" required>
     <input name="execution_id" placeholder="execution_id" required><input name="disco" placeholder="Disco externo" required>
-    <input name="notes" placeholder="Notas"><button>Registrar</button></form><pre id="r"></pre>
+    <input name="notes" placeholder="Notas"><button>Registrar</button></form><pre id="r"></pre><h2>Registros existentes</h2><ul id="events"></ul>
     <script>document.querySelector('#f').onsubmit=async e=>{e.preventDefault();let d=Object.fromEntries(new FormData(e.target));
     let r=await fetch('/api/traslados',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-    document.querySelector('#r').textContent=await r.text()}</script>"""
+    document.querySelector('#r').textContent=await r.text();refresh()};async function refresh(){let d=await(await fetch('/api/traslados')).json();let ul=document.querySelector('#events');ul.textContent='';
+    for(let x of d.traslados){let li=document.createElement('li');li.textContent=x.period+' · '+x.machine+' · '+x.disk+' · '+x.event_id+' ';
+    let b=document.createElement('button');b.textContent='Eliminar respaldo local';b.onclick=async()=>{if(prompt('Escribe ELIMINAR para confirmar')!=='ELIMINAR')return;
+    let z=await fetch('/api/respaldo/'+encodeURIComponent(x.machine)+'/'+encodeURIComponent(x.period),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmacion:'ELIMINAR',event_id:x.event_id})});alert(await z.text());refresh()};
+    li.appendChild(b);ul.appendChild(li)}}refresh()</script>"""
 if __name__ == "__main__":
     if "--backup-history" in sys.argv:
         try:
