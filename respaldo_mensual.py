@@ -1393,7 +1393,7 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
             log(f"No se pudo guardar el historial local: {exc}")
         if (y, m) == prev_month():
             cfg["last_status"], cfg["last_attempt"] = res["status"], date.today().isoformat()
-            if res["status"] == "ok":
+            if res["status"] == "verified":
                 cfg["last_done"] = tag
             save_cfg(cfg)
         if res["status"] in ("ok", "error"):
