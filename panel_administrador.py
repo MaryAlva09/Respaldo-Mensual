@@ -66,7 +66,8 @@ def save_cfg(cfg):
 CFG = load_cfg()
 app = Flask(__name__)
 app.secret_key = CFG["secret_key"]
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=bool(CFG.get("tls_cert") and CFG.get("tls_key")))
+_TLS_ACTIVE = bool(CFG.get("tls_cert") and CFG.get("tls_key") and Path(CFG["tls_cert"]).is_file() and Path(CFG["tls_key"]).is_file())
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=_TLS_ACTIVE)
 
 
 def estado_dir():
@@ -553,6 +554,7 @@ def login():
             if not stored_admin.startswith(("scrypt:", "pbkdf2:")):
                 CFG["password_hash"] = generate_password_hash(pw); save_cfg(CFG)
             session.clear(); session["ok"] = True; session["username"] = username
+            _audit_event("admin_login")
             return redirect(url_for("dashboard"))
         ro = CFG.get("readonly_hash", "")
         reader_ok = (check_password_hash(ro, pw) if ro.startswith(("scrypt:", "pbkdf2:")) else ph == ro) if ro else False
@@ -560,6 +562,7 @@ def login():
             if not ro.startswith(("scrypt:", "pbkdf2:")):
                 CFG["readonly_hash"] = generate_password_hash(pw); save_cfg(CFG)
             session.clear(); session["readonly"] = True; session["username"] = username
+            _audit_event("readonly_login")
             return redirect(url_for("dashboard"))
         error = "Usuario o contraseña incorrectos."
     return render_template_string(LOGIN_HTML, css=Markup(BASE_CSS), error=error)
@@ -626,13 +629,21 @@ def api_estado():
 def api_respaldar(maquina):
     if not logueado():   # solo lectura NO puede pedir respaldos
         return jsonify({"ok": False, "error": "Solo el administrador puede pedir respaldos"}), 403
-    mes = (request.get_json(silent=True) or {}).get("mes", prev_month_str())
+    mes = str((request.get_json(silent=True) or {}).get("mes", prev_month_str())).strip()
+    if not maquina.strip() or any(x in maquina for x in ("/", "\\", "..")):
+        return jsonify({"ok": False, "error": "Máquina inválida."}), 400
     try:
+        if len(mes) != 7 or mes[4] != "-" or not mes[:4].isdigit() or not mes[5:].isdigit() or not 1 <= int(mes[5:]) <= 12:
+            return jsonify({"ok": False, "error": "Período inválido. Usa AAAA-MM."}), 400
+        if (int(mes[:4]), int(mes[5:])) >= (date.today().year, date.today().month):
+            return jsonify({"ok": False, "error": "El respaldo manual debe ser de un mes anterior."}), 400
         rf = solicitudes_dir() / f"{maquina.strip()}.json"
         rf.parent.mkdir(parents=True, exist_ok=True)
         rf.write_text(json.dumps({"accion": "respaldar_ahora", "mes": mes,
+                                   "requested_by": session.get("username", "admin"),
                                    "pedido_el": datetime.now().isoformat(timespec="seconds")}),
                       encoding="utf-8")
+        _audit_event("manual_backup_requested", {"machine": maquina, "period": mes})
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -704,6 +715,7 @@ def config_view():
         elif request.form.get("disable_ro"):
             CFG["readonly_hash"] = ""
         save_cfg(CFG)
+        _audit_event("settings_changed", {"admin_user_changed": bool(admin_user), "credentials_changed": bool(pw or pw_ro)})
         return redirect(url_for("dashboard"))
     # Plantilla extendida con campo para usuario de solo lectura
     cfg_html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
