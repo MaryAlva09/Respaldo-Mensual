@@ -1349,7 +1349,7 @@ def send(cfg, tag, log, prog=None):
 
 
 # ------------------------------------------------------------------ trabajo completo
-def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
+def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True, mode="scheduled", requested_by=""):
     tag = f"{y}-{m:02d}"
     if not acquire_lock():
         log("Ya hay un respaldo en curso; esta ejecución se omite.")
@@ -1359,7 +1359,7 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
         prog = load_prog(tag)
         execution_id = str(uuid.uuid4())
         started_at = datetime.now().astimezone().isoformat()
-        res = {"status": "local", "files": 0, "mails": 0, "errors": []}
+        res = {"status": "pending", "files": 0, "mails": 0, "errors": []}
         collected = prog["collect_done"]
         if not collected and collect_allowed:
             if prog["mail"] or prog["files_done"]:
@@ -1379,16 +1379,21 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
             elif not ok:
                 log("  Envío pendiente; se reintentará.")
         if prog["collect_done"] and prog["send_done"]:
-            res["status"] = "ok"
-        elif prog["errors"]:
-            res["status"] = "error"
-        if prog.get("files_errors") or prog.get("unclassifiable_mails"):
-            if res["status"] == "ok": res["status"] = "partial"
+            res["status"] = "partial" if (prog.get("files_errors") or prog.get("unclassifiable_mails") or prog["errors"]) else "verified"
+        elif prog["errors"] or prog.get("files_errors") or prog.get("unclassifiable_mails"):
+            res["status"] = "partial"
         res.update(files=prog["files"], mails=prog["mails"], errors=list(prog["errors"]))
         save_prog(tag, prog)
         try:
-            write_execution_history(cfg, tag, prog, res, started_at, execution_id,
-                                    "scheduled" if collect_allowed else "resume")
+            entry = write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode)
+            entry["requested_by"] = requested_by
+            for dest in destinations(cfg):
+                if dest_reachable(dest)[0]:
+                    hist_path = Path(dest) / "_historial" / cfg.get("machine_name", "equipo") / f"{execution_id}.json"
+                    hist_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_hist = hist_path.with_suffix(".tmp")
+                    tmp_hist.write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
+                    os.replace(tmp_hist, hist_path)
         except Exception as exc:
             log(f"No se pudo guardar el historial local: {exc}")
         if (y, m) == prev_month():
@@ -1396,20 +1401,20 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True):
             if res["status"] == "verified":
                 cfg["last_done"] = tag
             save_cfg(cfg)
-        if res["status"] in ("ok", "error"):
+        if res["status"] in ("verified", "partial"):
             for d in ([used] if used else destinations(cfg)):
                 if dest_reachable(d)[0]:
                     write_status(cfg, tag, res, d)
                     # Reportar el estado final antes de borrar el archivo de progreso
                     report_progress(cfg,
-                                    "listo" if res["status"] == "ok" else "error",
-                                    ("Respaldo completado" if res["status"] == "ok"
+                                    "listo" if res["status"] == "verified" else "error",
+                                    ("Respaldo verificado" if res["status"] == "verified"
                                      else f"Terminó con {len(res['errors'])} error(es)"),
                                     archivos=res["files"], correos=res["mails"], dest=d)
                     time.sleep(5)   # dar tiempo al panel para leer el estado final
                     clear_progress(cfg, d)
                     break
-        if res["status"] == "ok" and cfg.get("delete_local_after_send"):
+        if res["status"] == "verified" and cfg.get("delete_local_after_send"):
             shutil.rmtree(local_dir(cfg, tag), ignore_errors=True)
         log(f"== {tag}: {res['status'].upper()} (archivos={res['files']}, correos={res['mails']}, "
             f"errores={len(res['errors'])})")
@@ -1449,12 +1454,16 @@ def check_backup_request(cfg, log):
         except Exception:
             pass
         mes = data.get("mes", "")
-        if mes and len(mes) == 7 and mes[4] == "-":
+        try:
             y, m = int(mes[:4]), int(mes[5:])
-        else:
-            y, m = prev_month()
-        log(f"Solicitud recibida desde el panel del administrador: respaldar {y}-{m:02d} ahora.")
-        run_job(cfg, y, m, log, collect_allowed=True)
+            if len(mes) != 7 or mes[4] != "-" or not 1 <= m <= 12 or not 2000 <= y <= date.today().year:
+                raise ValueError("periodo invalido")
+        except (TypeError, ValueError):
+            log(f"Solicitud de respaldo ignorada: período inválido ({mes!r}).")
+            continue
+        requested_by = str(data.get("requested_by", "administrador"))
+        log(f"Solicitud recibida de {requested_by}: respaldar {y}-{m:02d} ahora.")
+        run_job(cfg, y, m, log, collect_allowed=True, mode="manual", requested_by=requested_by)
         return True
     return False
 
@@ -1591,9 +1600,9 @@ def run_auto(mode):
         if cfg["last_status"] == "error" and cfg["last_attempt"] == today.isoformat() and not pend:
             return
         for t in pend:
-            run_job(cfg, int(t[:4]), int(t[5:]), log, collect_allowed=False)
+            run_job(cfg, int(t[:4]), int(t[5:]), log, collect_allowed=True, mode="resume")
         if needs:
-            run_job(cfg, y, m, log, collect_allowed=allow)
+            run_job(cfg, y, m, log, collect_allowed=allow, mode="scheduled")
     else:
         run_job(cfg, y, m, log)
 
