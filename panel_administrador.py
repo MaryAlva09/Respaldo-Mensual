@@ -1185,6 +1185,10 @@ def api_eliminar_respaldo(maquina, periodo):
     data = request.get_json(silent=True) or {}
     if data.get("confirmacion") != "ELIMINAR":
         return jsonify({"error": "Escribe ELIMINAR para confirmar."}), 400
+    if len(periodo) != 7 or periodo[4] != "-" or not periodo[:4].isdigit() or not periodo[5:].isdigit() or not 1 <= int(periodo[5:]) <= 12:
+        return jsonify({"error": "Período inválido."}), 400
+    if not maquina or any(x in maquina for x in ("/", "\\", "..")):
+        return jsonify({"error": "Máquina inválida."}), 400
     event_id = str(data.get("event_id", ""))
     event_file = Path(CFG.get("destino_root", "")) / "_traslados" / f"{event_id}.json"
     try:
@@ -1204,6 +1208,19 @@ def api_eliminar_respaldo(maquina, periodo):
     shutil.rmtree(target)
     _audit_event("backup_manually_deleted", {"machine": maquina, "period": periodo, "event_id": event_id})
     return jsonify({"ok": True})
+
+
+
+@app.route("/historial")
+def historial_view():
+    if not puede_ver():
+        return redirect(url_for("login"))
+    return """<!doctype html><meta charset="utf-8"><title>Historial de ejecuciones</title>
+    <h1>Historial de respaldos</h1><form id="f"><input name="maquina" placeholder="Máquina">
+    <input name="mes" placeholder="AAAA-MM"><input name="execution_id" placeholder="execution_id">
+    <button>Buscar</button></form><pre id="r"></pre>
+    <script>document.querySelector('#f').onsubmit=async e=>{e.preventDefault();let q=new URLSearchParams(new FormData(e.target));
+    let r=await fetch('/api/historial?'+q);document.querySelector('#r').textContent=JSON.stringify(await r.json(),null,2)}</script>"""
 
 
 @app.route("/traslados")
@@ -1230,7 +1247,9 @@ if __name__ == "__main__":
     else:
         cert = CFG.get("tls_cert", "").strip()
         key = CFG.get("tls_key", "").strip()
-        if not cert or not key or not Path(cert).is_file() or not Path(key).is_file():
-            raise SystemExit("Configura un certificado TLS válido (tls_cert/tls_key) antes de exponer el panel.")
-        print("Panel protegido con HTTPS en https://localhost:5000")
-        app.run(host="0.0.0.0", port=5000, threaded=True, ssl_context=(cert, key))
+        if cert and key and Path(cert).is_file() and Path(key).is_file():
+            print("Panel protegido con HTTPS en https://localhost:5000")
+            app.run(host="0.0.0.0", port=5000, threaded=True, ssl_context=(cert, key))
+        else:
+            print("Configura tls_cert y tls_key desde el panel local; mientras tanto solo escucha en 127.0.0.1.")
+            app.run(host="127.0.0.1", port=5000, threaded=True)
