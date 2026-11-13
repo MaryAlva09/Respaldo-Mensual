@@ -41,7 +41,7 @@ pyinstaller --onedir --noconsole --name PanelAdministrador panel_administrador.p
 ```powershell
 .\Instalar-PanelAdministrador.ps1 -CarpetaApp .\PanelAdministrador
 ```
-Luego abre `http://localhost:5000` y completa la configuración inicial.
+El panel se inicia en `http://127.0.0.1:5000` solo durante la configuración inicial. Define destino y contraseña, configura en **Configuración** el certificado TLS y la clave privada; al reiniciar, el acceso remoto será por HTTPS. El instalador también programa una copia diaria verificada del historial.
 
 ### 3. Desplegar el agente en las laptops
 Rellena `maquinas_ejemplo.csv` con los nombres reales y ejecuta:
@@ -69,11 +69,13 @@ Entra al panel → **Lista de máquinas esperadas** → pega los 120 nombres.
 - Usa la IP fija de PC100 como destino principal para evitar problemas con la resolución de nombres en redes públicas
 
 **Panel del administrador (PC100):**
-- Página web local en `http://localhost:5000` (o `http://IP-PC100:5000` desde la red)
-- Muestra el estado de cada máquina: verde (respaldada), naranja (con errores), rojo (sin respaldo)
-- Botón "Respaldar ahora" junto a cada máquina — la laptop lo ejecuta en los próximos 5 minutos
-- Buscador, selector de mes, lista de máquinas esperadas
-- Protegido con contraseña
+- Arranca por HTTP solo durante la configuración inicial y escucha en 127.0.0.1 hasta configurar TLS.
+- Muestra el estado de cada máquina y permite respaldos manuales de meses anteriores.
+- `/historial` permite consultar ejecuciones por máquina, usuario, mes o execution_id.
+- `/traslados` registra discos externos; el registro no afirma verificación física del disco.
+- El borrado local es manual, exige un traslado registrado y confirmación `ELIMINAR`.
+- Una tarea diaria copia el historial a la ruta independiente configurada y verifica SHA-256.
+- Las contraseñas usan hashes seguros; la contraseña de red no se persiste en `config.json`.
 
 ---
 
@@ -92,3 +94,14 @@ Entra al panel → **Lista de máquinas esperadas** → pega los 120 nombres.
 ## Historial de versiones
 
 Ver `HISTORIAL.md` para el detalle completo de las 7 versiones del agente y las versiones del panel.
+
+
+## Cumplimiento de BackupDesk SRS v1.1
+
+- El agente procesa el mes calendario anterior durante los días 1–9, de lunes a sábado, desde las 09:00. Al iniciar, reanuda meses pendientes por orden cronológico y conserva checkpoints.
+- Los archivos se seleccionan por creación o última modificación. Los mensajes EML se separan por cuenta, conservan carpetas personalizadas y usan fechas fiables del mensaje.
+- La transferencia se verifica por tamaño y SHA-256 y admite un intento inicial más tres reintentos (5, 15 y 30 minutos).
+- Cada ejecución tiene un `execution_id` propio publicado en `_historial` en PC100.
+- Configura `history_backup_root` en una ubicación físicamente independiente. Sin ella, la tarea diaria deja un error registrado en el panel.
+- El panel no borra automáticamente los respaldos. La eliminación manual requiere que exista un evento de traslado registrado.
+- Para acceso remoto, configura certificado y clave TLS en **Configuración**; sin ellos el panel escucha únicamente en localhost.
