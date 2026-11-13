@@ -508,13 +508,13 @@ def test_destinations(cfg, log):
 
 
 
-def write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode):
+def write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode, requested_by=""):
     """Guarda un registro independiente por ejecución para consultas y auditoría."""
     entry = {
         "execution_id": execution_id, "machine": cfg.get("machine_name", ""),
         "user": os.environ.get("USERNAME") or os.environ.get("USER", ""),
         "period": tag, "started_at": started_at, "ended_at": datetime.now().astimezone().isoformat(),
-        "mode": mode, "files_found": prog.get("files_found", 0),
+        "mode": mode, "requested_by": requested_by, "files_found": prog.get("files_found", 0),
         "files_selected": prog.get("files_selected", 0), "files_copied": prog.get("files_copied", 0),
         "mails_processed": prog.get("mails", 0), "mails_unclassifiable": prog.get("unclassifiable_mails", 0),
         "transfer_attempts": prog.get("transfer_attempts", 0),
@@ -1369,6 +1369,10 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True, mode="sche
         started_at = datetime.now().astimezone().isoformat()
         res = {"status": "pending", "files": 0, "mails": 0, "errors": []}
         collected = prog["collect_done"]
+        if mode == "manual" and prog.get("transfer_status") == "pending":
+            prog["transfer_attempts"] = 0
+            prog["next_retry_at"] = ""
+            save_prog(tag, prog)
         if not collected and collect_allowed:
             if prog["mail"] or prog["files_done"]:
                 log(f"Retomando {tag}: {sum(1 for s in prog['mail'].values() if s.get('done'))} buzones ya completos")
@@ -1378,7 +1382,18 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True, mode="sche
             except Stopped:
                 save_prog(tag, prog)
                 log("Detenido. Se retomará desde el último punto de control.")
-                res["status"] = "stopped"; return res
+                res.update(status="stopped", files=prog.get("files", 0), mails=prog.get("mails", 0),
+                           errors=list(prog.get("errors", [])))
+                try:
+                    entry = write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode, requested_by)
+                    for dest in destinations(cfg):
+                        if dest_reachable(dest)[0]:
+                            hist_path = Path(dest) / "_historial" / cfg.get("machine_name", "equipo") / f"{execution_id}.json"
+                            hist_path.parent.mkdir(parents=True, exist_ok=True)
+                            hist_path.write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception as exc:
+                    log(f"No se pudo guardar el historial de interrupción: {exc}")
+                return res
         used = None
         if collected and not (prog["collect_done"] and prog["send_done"]):
             ok, used, why = send(cfg, tag, log, prog)
@@ -1393,8 +1408,7 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True, mode="sche
         res.update(files=prog["files"], mails=prog["mails"], errors=list(prog["errors"]))
         save_prog(tag, prog)
         try:
-            entry = write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode)
-            entry["requested_by"] = requested_by
+            entry = write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode, requested_by)
             for dest in destinations(cfg):
                 if dest_reachable(dest)[0]:
                     hist_path = Path(dest) / "_historial" / cfg.get("machine_name", "equipo") / f"{execution_id}.json"
@@ -1409,7 +1423,7 @@ def run_job(cfg, y, m, log, stop=lambda: False, collect_allowed=True, mode="sche
             if res["status"] == "verified":
                 cfg["last_done"] = tag
             save_cfg(cfg)
-        if res["status"] in ("verified", "partial"):
+        if res["status"] in ("verified", "partial", "pending"):
             for d in ([used] if used else destinations(cfg)):
                 if dest_reachable(d)[0]:
                     write_status(cfg, tag, res, d)
