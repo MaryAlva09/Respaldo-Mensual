@@ -66,6 +66,7 @@ def save_cfg(cfg):
 CFG = load_cfg()
 app = Flask(__name__)
 app.secret_key = CFG["secret_key"]
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=bool(CFG.get("tls_cert") and CFG.get("tls_key")))
 
 
 def estado_dir():
@@ -1121,6 +1122,7 @@ def api_historial():
     machine = request.args.get("maquina", "").strip()
     period = request.args.get("mes", "").strip()
     execution_id = request.args.get("execution_id", "").strip()
+    user = request.args.get("usuario", "").strip()
     if any(x in machine for x in ("/", "\\", "..")):
         return jsonify({"error": "máquina inválida"}), 400
     root = Path(CFG.get("destino_root", "")) / "_historial"
@@ -1132,6 +1134,10 @@ def api_historial():
             if period and value.get("period") != period:
                 continue
             if machine and value.get("machine", "").casefold() != machine.casefold():
+                continue
+            if user and value.get("user", "").casefold() != user.casefold():
+                continue
+            if execution_id and value.get("execution_id") != execution_id:
                 continue
             records.append(value)
         except (OSError, ValueError):
