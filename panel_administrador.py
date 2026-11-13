@@ -19,7 +19,7 @@ La primera vez te pedirá la carpeta local de los respaldos (la ruta
 real en el disco de PC100 detrás de la carpeta compartida, ej. D:\\Respaldos)
 y te deja fijar la contraseña del panel.
 """
-import os, sys, json, hashlib, secrets, shutil, uuid
+import os, sys, json, hashlib, secrets, shutil, uuid, time
 from werkzeug.security import generate_password_hash, check_password_hash
 from pathlib import Path
 from datetime import datetime, date
@@ -1112,6 +1112,8 @@ def backup_history():
         return {"copied": 0, "verified": 0, "status": "empty"}
     if source.resolve() == target_root.resolve() or source.resolve() in target_root.resolve().parents or target_root.resolve() in source.resolve().parents:
         raise RuntimeError("El destino del historial no puede estar dentro de la carpeta fuente.")
+    if source.resolve().drive.casefold() == target_root.resolve().drive.casefold():
+        raise RuntimeError("El historial debe respaldarse en un volumen físicamente independiente.")
     target = target_root / date.today().isoformat()
     copied = verified = 0
     for src in source.rglob("*"):
@@ -1126,6 +1128,28 @@ def backup_history():
         verified += 1
     return {"copied": copied, "verified": verified, "status": "verified"}
 
+
+
+
+def backup_history_with_retries():
+    delays = (300, 900, 1800)
+    log_path = CFG_DIR / "history_backup_log.jsonl"
+    for attempt in range(4):
+        try:
+            result = backup_history()
+            record = {"at": datetime.now().astimezone().isoformat(), "attempt": attempt + 1, **result}
+            CFG_DIR.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return result
+        except Exception as exc:
+            record = {"at": datetime.now().astimezone().isoformat(), "attempt": attempt + 1, "status": "error", "error": str(exc)}
+            CFG_DIR.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if attempt == 3:
+                raise
+            time.sleep(delays[attempt])
 
 @app.route("/api/historial")
 def api_historial():
@@ -1272,7 +1296,7 @@ def traslados_view():
 if __name__ == "__main__":
     if "--backup-history" in sys.argv:
         try:
-            print(json.dumps(backup_history(), ensure_ascii=False))
+            print(json.dumps(backup_history_with_retries(), ensure_ascii=False))
         except Exception as exc:
             CFG_DIR.mkdir(parents=True, exist_ok=True)
             with (CFG_DIR / "history_backup_errors.log").open("a", encoding="utf-8") as fh:
