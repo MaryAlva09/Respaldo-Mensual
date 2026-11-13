@@ -61,8 +61,8 @@ Entra al panel → **Lista de máquinas esperadas** → pega los 120 nombres.
 
 **Agente (cada laptop):**
 - Corre como SYSTEM en segundo plano, invisible para el usuario
-- El día 1 de cada mes respalda todo el mes anterior (archivos + correos)
-- Si no hay red o la laptop estaba apagada, reintenta hasta el día 9
+- Durante la ventana de los días 1–9, lunes a sábado y desde las 09:00, respalda el mes calendario anterior (archivos + correos)
+- Si el equipo estaba apagado, al iniciar detecta y reanuda meses pendientes en orden cronológico; las transferencias usan cuatro intentos con esperas de 5, 15 y 30 minutos
 - Guarda primero una copia local (no necesita red en ese momento) y luego la envía a PC100
 - Si se interrumpe, retoma exactamente donde se quedó (checkpoint cada 15 segundos)
 - Detecta automáticamente al usuario real (excluye cuentas de administrador)
@@ -74,7 +74,7 @@ Entra al panel → **Lista de máquinas esperadas** → pega los 120 nombres.
 - `/historial` permite consultar ejecuciones por máquina, usuario, mes o execution_id.
 - `/traslados` registra discos externos; el registro no afirma verificación física del disco.
 - El borrado local es manual, exige un traslado registrado y confirmación `ELIMINAR`.
-- Una tarea diaria copia el historial a la ruta independiente configurada y verifica SHA-256.
+- Una tarea diaria copia el historial a la ruta independiente configurada y verifica SHA-256, con tres reintentos a 5, 15 y 30 minutos.
 - Las contraseñas usan hashes seguros; la contraseña de red no se persiste en `config.json`.
 
 ---
@@ -102,6 +102,6 @@ Ver `HISTORIAL.md` para el detalle completo de las 7 versiones del agente y las 
 - Los archivos se seleccionan por creación o última modificación. Los mensajes EML se separan por cuenta, conservan carpetas personalizadas y usan fechas fiables del mensaje.
 - La transferencia se verifica por tamaño y SHA-256 y admite un intento inicial más tres reintentos (5, 15 y 30 minutos).
 - Cada ejecución tiene un `execution_id` propio publicado en `_historial` en PC100.
-- Configura `history_backup_root` en una ubicación físicamente independiente. Sin ella, la tarea diaria deja un error registrado en el panel.
+- Configura `history_backup_root` en una ubicación físicamente independiente. Sin ella, la tarea diaria falla y registra el detalle en `history_backup_log.jsonl` y `history_backup_errors.log` dentro de la carpeta de configuración de PC100.
 - El panel no borra automáticamente los respaldos. La eliminación manual requiere que exista un evento de traslado registrado.
 - Para acceso remoto, configura certificado y clave TLS en **Configuración**; sin ellos el panel escucha únicamente en localhost.
