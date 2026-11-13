@@ -529,6 +529,8 @@ def puede_ver():
 
 @app.route("/api/diagnostico")
 def api_diagnostico():
+    if not puede_ver():
+        return jsonify({"error": "no autorizado"}), 401
     d = estado_dir()
     return jsonify({
         "panel_ok": True,
@@ -1078,7 +1080,7 @@ def api_progreso():
 @app.route("/api/correos/<maquina>/<mes>")
 def api_correos(maquina, mes):
     """API JSON: lista de correos de una máquina y mes para usar desde el dashboard."""
-    if not logueado():
+    if not puede_ver():
         return jsonify({"error": "no autorizado"}), 401
     emls = _list_emls(maquina, mes)
     return jsonify({"total": len(emls), "correos": emls})
