@@ -1149,7 +1149,7 @@ def backup_history_with_retries():
             CFG_DIR.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if attempt == 3:
+            if isinstance(exc, RuntimeError) or attempt == 3:
                 raise
             time.sleep(delays[attempt])
 
