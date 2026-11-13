@@ -153,7 +153,11 @@ def load_cfg():
 
 def save_cfg(cfg):
     CFG_DIR.mkdir(parents=True, exist_ok=True)
-    CFG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    persisted = dict(cfg)
+    # La contraseña de red se mantiene solo en memoria durante la configuración
+    # y se guarda en Credential Manager; nunca en config.json.
+    persisted["net_pass"] = ""
+    CFG_FILE.write_text(json.dumps(persisted, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def hide_path(p: Path):
@@ -515,6 +519,9 @@ def write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode)
         "mails_processed": prog.get("mails", 0), "mails_unclassifiable": prog.get("unclassifiable_mails", 0),
         "transfer_attempts": prog.get("transfer_attempts", 0),
         "verification_status": prog.get("verification_status", "pending"),
+        "collection_status": "complete" if prog.get("collect_done") else ("partial" if prog.get("files_done") or prog.get("mail") else "pending"),
+        "transfer_status": prog.get("transfer_status", "pending"),
+        "duration_seconds": round((datetime.now().astimezone() - datetime.fromisoformat(started_at)).total_seconds(), 2),
         "errors": list(res.get("errors", []))[:200], "status": res.get("status", "partial"),
     }
     path = Path(cfg.get("history_root") or (CFG_DIR / "historial")) / cfg.get("machine_name", "equipo") / f"{execution_id}.json"
@@ -1166,8 +1173,9 @@ def mount_net_path(dest, user, password, log=None):
 
     def _connect():
         args = ["net", "use", unc_base]
-        if user:
-            args += [f"/user:{user}", password or ""]
+        if user and password:
+            args += [f"/user:{user}", password]
+        # Sin contraseña, Windows usa la credencial ya guardada en Credential Manager.
         args += ["/persistent:no"]
         return subprocess.run(args, capture_output=True,
                               text=True, encoding="cp850", errors="replace", timeout=15)
@@ -1456,7 +1464,7 @@ def check_backup_request(cfg, log):
         mes = data.get("mes", "")
         try:
             y, m = int(mes[:4]), int(mes[5:])
-            if len(mes) != 7 or mes[4] != "-" or not 1 <= m <= 12 or not 2000 <= y <= date.today().year:
+            if len(mes) != 7 or mes[4] != "-" or not 1 <= m <= 12 or not 2000 <= y <= date.today().year or (y, m) >= (date.today().year, date.today().month):
                 raise ValueError("periodo invalido")
         except (TypeError, ValueError):
             log(f"Solicitud de respaldo ignorada: período inválido ({mes!r}).")
@@ -1581,8 +1589,9 @@ def run_auto(mode):
             slot = my_minute_slot(cfg["machine_name"])
             if abs(datetime.now().minute - slot) > 2:
                 return                                            # aún no es su turno en esta hora
-        pend = [fp.stem for fp in PROG_DIR.glob("*.json")
-                if fp.stem != tag and load_prog(fp.stem)["collect_done"] and not load_prog(fp.stem)["send_done"]]
+        pend = sorted([fp.stem for fp in PROG_DIR.glob("*.json")
+                if fp.stem != tag and not load_prog(fp.stem)["send_done"] and
+                (load_prog(fp.stem)["files_done"] or bool(load_prog(fp.stem)["mail"]) or load_prog(fp.stem)["collect_done"])])
         now = datetime.now()
         allow = today.day <= WINDOW_DAYS and today.weekday() < 6 and now.hour >= 9
         needs = cfg["last_done"] != tag and (allow or (prog["files_done"] or bool(prog["mail"]) or
