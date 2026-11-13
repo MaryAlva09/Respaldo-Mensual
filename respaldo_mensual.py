@@ -512,10 +512,11 @@ def write_execution_history(cfg, tag, prog, res, started_at, execution_id, mode,
     """Guarda un registro independiente por ejecución para consultas y auditoría."""
     entry = {
         "execution_id": execution_id, "machine": cfg.get("machine_name", ""),
-        "user": os.environ.get("USERNAME") or os.environ.get("USER", ""),
+        "user": ", ".join(prog.get("target_users", [])) or cfg.get("target_user") or os.environ.get("USERNAME") or os.environ.get("USER", ""),
         "period": tag, "started_at": started_at, "ended_at": datetime.now().astimezone().isoformat(),
         "mode": mode, "requested_by": requested_by, "files_found": prog.get("files_found", 0),
         "files_selected": prog.get("files_selected", 0), "files_copied": prog.get("files_copied", 0),
+        "files_skipped": prog.get("files_skipped", 0), "files_errors": prog.get("files_errors", 0),
         "mails_processed": prog.get("mails", 0), "mails_unclassifiable": prog.get("unclassifiable_mails", 0),
         "transfer_attempts": prog.get("transfer_attempts", 0),
         "verification_status": prog.get("verification_status", "pending"),
@@ -614,6 +615,7 @@ def collect(cfg, y, m, prog, log, stop):
         errors.append(msg); log("  ERROR: " + msg)
 
     users, extra, user_sources = resolve_all_sources(cfg, log)
+    prog["target_users"] = [u.name for u in users]
     log(f"== Recopilando {tag} — usuario(s) objetivo: {[u.name for u in users] or 'NINGUNO'}")
     all_sources = [(Path(e).name or Path(e).drive.replace(":", ""), Path(e)) for e in extra] + user_sources
 
@@ -1042,13 +1044,6 @@ def backup_mail(cfg, base, sub, out_base, start, end,
                 continue
 
             try:
-                if (
-                    not st.get("offset")
-                    and p.stat().st_mtime < start.timestamp()
-                ):
-                    st.update(done=True, count=0, version=3)
-                    continue
-
                 resuming = bool(st.get("offset"))
 
                 log(
