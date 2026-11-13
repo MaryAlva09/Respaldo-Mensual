@@ -1602,14 +1602,14 @@ def run_auto(mode):
     if mode == "catchup":
         prog = load_prog(tag)
         started = prog["files_done"] or prog["collect_done"] or bool(prog["mail"])
-        if not started:
-            slot = my_minute_slot(cfg["machine_name"])
-            if abs(datetime.now().minute - slot) > 2:
-                return                                            # aún no es su turno en esta hora
         pend = sorted([fp.stem for fp in PROG_DIR.glob("*.json")
                 if fp.stem != tag and not load_prog(fp.stem)["send_done"] and
                 (not load_prog(fp.stem)["collect_done"] or load_prog(fp.stem).get("transfer_attempts", 0) < 4) and
                 (load_prog(fp.stem)["files_done"] or bool(load_prog(fp.stem)["mail"]) or load_prog(fp.stem)["collect_done"])])
+        if not started and not pend:
+            slot = my_minute_slot(cfg["machine_name"])
+            if abs(datetime.now().minute - slot) > 2:
+                return                                            # aún no es su turno en esta hora
         now = datetime.now()
         allow = today.day <= WINDOW_DAYS and today.weekday() < 6 and now.hour >= 9
         retryable = not (prog["collect_done"] and prog["send_done"]) and (not prog["collect_done"] or prog.get("transfer_attempts", 0) < 4)
